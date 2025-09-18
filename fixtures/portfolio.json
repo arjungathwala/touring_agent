@@ -1,0 +1,29 @@
+[
+  {
+    "id": "21we",
+    "name": "21 West End",
+    "address": "1 W End Ave, New York, NY 10023",
+    "lat": 40.7749,
+    "lng": -73.9885,
+    "timezone": "America/New_York",
+    "sisters": ["hudson-360", "riverview-lofts"]
+  },
+  {
+    "id": "hudson-360",
+    "name": "Hudson 360",
+    "address": "360 W 43rd St, New York, NY 10036",
+    "lat": 40.7581,
+    "lng": -73.9903,
+    "timezone": "America/New_York",
+    "sisters": ["21we", "riverview-lofts"]
+  },
+  {
+    "id": "riverview-lofts",
+    "name": "Riverview Lofts",
+    "address": "500 48th Ave, Long Island City, NY 11109",
+    "lat": 40.7478,
+    "lng": -73.9593,
+    "timezone": "America/New_York",
+    "sisters": ["21we"]
+  }
+]

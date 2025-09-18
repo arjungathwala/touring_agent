@@ -1,0 +1,26 @@
+[
+  {
+    "property_id": "21we",
+    "policy_type": "pet",
+    "description": "Dogs up to 50lbs allowed. Cats allowed. $500 pet deposit.",
+    "notes": "Breed restrictions apply."
+  },
+  {
+    "property_id": "21we",
+    "policy_type": "income",
+    "description": "40x annual rent or guarantor at 70x.",
+    "notes": "International students accepted with I-20."
+  },
+  {
+    "property_id": "hudson-360",
+    "policy_type": "pet",
+    "description": "Dogs and cats allowed. $65 monthly pet rent.",
+    "notes": "Max 2 pets per unit."
+  },
+  {
+    "property_id": "riverview-lofts",
+    "policy_type": "pet",
+    "description": "Cats only. $400 deposit.",
+    "notes": "No dogs permitted."
+  }
+]
