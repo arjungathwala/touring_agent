@@ -32,3 +32,16 @@ async def twilio_voice(request: Request) -> Response:
     </Connect>
 </Response>"""
     return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/test-voice")
+async def test_voice_endpoint(request: Request) -> Response:
+    """Test endpoint that returns the TwiML with localhost WebSocket for debugging"""
+    twiml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<Response>
+    <Say voice=\"Polly.Joanna\">This is a test connection to your leasing specialist.</Say>
+    <Connect>
+        <Stream url=\"ws://localhost:8000/twilio/media-stream\"/>
+    </Connect>
+</Response>"""
+    return Response(content=twiml, media_type="application/xml")

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import audioop
 import asyncio
 import base64
 import io
@@ -10,11 +9,13 @@ import os
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import logging
 import httpx
-import websockets
+from deepgram import DeepgramClient as SDKDeepgramClient, FileSource, PrerecordedOptions
+from elevenlabs.client import ElevenLabs
+from elevenlabs import stream
 from fastapi import WebSocket
 
 from app.logging.flight_recorder import FlightRecorder
@@ -30,41 +31,57 @@ class DeepgramClient:
         self.recorder = recorder
         self.audio_buffer = bytearray()
         self.api_key = os.getenv("DEEPGRAM_API_KEY")
-        self._http: Optional[httpx.AsyncClient] = None
+        self._client: Optional[SDKDeepgramClient] = None
+        self._options: Optional[PrerecordedOptions] = None
         if self.api_key:
-            self._http = httpx.AsyncClient(
-                base_url="https://api.deepgram.com",
-                headers={
-                    "Authorization": f"Token {self.api_key}",
-                    "Content-Type": "application/octet-stream",
-                },
-                timeout=httpx.Timeout(10.0, connect=5.0),
+            self._client = SDKDeepgramClient(self.api_key)
+            model = os.getenv("DEEPGRAM_MODEL", "nova-3")  # Use latest model from docs
+            self._options = PrerecordedOptions(
+                model=model,
+                smart_format=True,
+                punctuate=True,
+                encoding="mulaw",
+                sample_rate=8000,
+                channels=1,
             )
-        self._min_flush_bytes = 3200
-        openai_key = os.getenv("OPENAI_API_KEY")
-        self._openai_http: Optional[httpx.AsyncClient] = None
-        if openai_key:
-            self._openai_http = httpx.AsyncClient(
-                base_url="https://api.openai.com/v1",
-                headers={"Authorization": f"Bearer {openai_key}"},
-                timeout=httpx.Timeout(20.0, connect=5.0),
-            )
-        self._openai_model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
-        self._openai_min_flush_bytes = 16000
+        self._min_flush_bytes = 800  # Even faster response for better UX
         self._no_asr_warned = False
 
     async def transcribe_chunk(self, audio_chunk: bytes) -> Optional[RealtimeTranscript]:
         self.audio_buffer.extend(audio_chunk)
-        if self._http:
+        self.recorder.log("ASR", "chunk_received", chunk_size=len(audio_chunk), buffer_total=len(self.audio_buffer))
+# Debug: print(f"🎤 Audio chunk: {len(audio_chunk)} bytes, buffer total: {len(self.audio_buffer)} bytes")
+        
+        if self._client and self._options:
             if len(self.audio_buffer) < self._min_flush_bytes:
+                self.recorder.log("ASR", "buffer_too_small", current=len(self.audio_buffer), needed=self._min_flush_bytes)
                 return None
-            return await self._flush_deepgram()
-        if self._openai_http:
-            if len(self.audio_buffer) < self._openai_min_flush_bytes:
-                return None
-            return await self._flush_openai()
+            # Analyze audio data before sending to Deepgram
+            audio_data = bytes(self.audio_buffer)
+            unique_values = len(set(audio_data))
+            non_silence_bytes = sum(1 for b in audio_data if b not in [0x00, 0xFF])
+            
+            # Calculate some basic audio statistics
+            avg_value = sum(audio_data) / len(audio_data) if audio_data else 0
+            min_value = min(audio_data) if audio_data else 0
+            max_value = max(audio_data) if audio_data else 0
+            
+            print(f"🔄 Transcribing {len(self.audio_buffer)} bytes: {unique_values} unique values, {non_silence_bytes} speech bytes")
+            
+            # Audio sample debugging (disabled)
+            # if needed for debugging, uncomment the file saving logic
+            
+            self.recorder.log("ASR", "deepgram_flush", buffered=len(self.audio_buffer))
+            result = await self._flush_deepgram()
+            if result:
+                print(f"✅ Transcript: '{result.transcript}' (confidence: {result.confidence:.2f})")
+            else:
+                print("❌ No speech detected")
+            return result
+        
         if not self._no_asr_warned:
-            self.recorder.log("ASR", "no_transcriber_available")
+            print("❌ No Deepgram client available!")
+            self.recorder.log("ASR", "no_deepgram_client_available")
             self._no_asr_warned = True
         self.audio_buffer.clear()
         return None
@@ -81,34 +98,39 @@ class DeepgramClient:
     async def finalize(self) -> Optional[RealtimeTranscript]:
         if not self.audio_buffer:
             return None
-        if self._http:
+        if self._client and self._options:
             return await self._flush_deepgram()
-        if self._openai_http:
-            return await self._flush_openai()
         self.audio_buffer.clear()
         return None
 
     async def _flush_deepgram(self) -> Optional[RealtimeTranscript]:
-        if not self._http:
+        if not self._client or not self._options:
             return None
         payload = bytes(self.audio_buffer)
         self.audio_buffer.clear()
+        file_source: FileSource = {"buffer": payload}
+
         try:
-            with self.recorder.stage("ASR", bytes=len(payload)):
-                response = await self._http.post(
-                    "/v1/listen",
-                    params={
-                        "model": "nova-2",
-                        "smart_format": "true",
-                        "punctuate": "true",
-                        "encoding": "mulaw",
-                        "sample_rate": 8000,
-                        "channels": 1,
-                    },
-                    content=payload,
+            def _sync_transcribe() -> dict[str, Any]:
+                response = self._client.listen.rest.v("1").transcribe_file(
+                    file_source,
+                    self._options,
                 )
-            response.raise_for_status()
-            data = response.json()
+                return response.to_dict() if hasattr(response, "to_dict") else response
+
+            with self.recorder.stage("ASR", bytes=len(payload)):
+                data = await asyncio.to_thread(_sync_transcribe)
+                self.recorder.log("ASR", "deepgram_raw_response", response=str(data)[:500])
+                # Debug: print(f"🔍 Deepgram response: {data}")
+                
+                # Check confidence and alternatives  
+                channels = data.get("results", {}).get("channels", [])
+                if channels:
+                    alternatives = channels[0].get("alternatives", [])
+                    # Debug: print(f"📊 Alternatives found: {len(alternatives)}")
+                    # for i, alt in enumerate(alternatives):
+                    #     print(f"  Alt {i}: '{alt.get('transcript', '')}' (confidence: {alt.get('confidence', 0)})")
+
             transcript_text = (
                 data.get("results", {})
                 .get("channels", [{}])[0]
@@ -127,244 +149,149 @@ class DeepgramClient:
                 )
                 self.recorder.log("ASR", "deepgram_transcript", transcript=transcript.transcript)
                 return transcript
-        except httpx.HTTPStatusError as exc:
-            body = exc.response.text if exc.response is not None else ""
-            logger.warning(
-                "deepgram.http_error status=%s body=%s",
-                exc.response.status_code if exc.response is not None else "?",
-                body[:500],
-                exc_info=True,
-            )
-            await self._disable_remote("http_status_error")
-        except httpx.HTTPError as exc:
-            logger.warning("deepgram.transport_error %s", exc, exc_info=True)
-            await self._disable_remote("transport_error")
+            self.recorder.log("ASR", "deepgram_empty_transcript", payload=data)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("deepgram.sdk_error %s", exc, exc_info=True)
+            self.recorder.log("ASR", "deepgram_sdk_error", error=str(exc))
         return None
 
-    async def _flush_openai(self) -> Optional[RealtimeTranscript]:
-        if not self._openai_http:
-            return None
-        payload = bytes(self.audio_buffer)
-        self.audio_buffer.clear()
-        pcm16 = _mulaw_to_pcm16(payload)
-        if not pcm16:
-            return None
-        wav_bytes = _pcm16_to_wav(pcm16, sample_rate=8000, channels=1)
-        files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
-        data = {
-            "model": self._openai_model,
-            "response_format": "json",
-            "temperature": "0",
-        }
-        try:
-            with self.recorder.stage("ASR", provider="openai", bytes=len(payload)):
-                response = await self._openai_http.post(
-                    "/audio/transcriptions",
-                    data=data,
-                    files=files,
-                )
-            response.raise_for_status()
-            json_data = response.json()
-            transcript_text = json_data.get("text", "").strip()
-            if transcript_text:
-                transcript = RealtimeTranscript(
-                    transcript=transcript_text,
-                    confidence=0.85,
-                    timestamp=datetime.now(timezone.utc),
-                )
-                self.recorder.log("ASR", "openai_transcript", transcript=transcript.transcript)
-                return transcript
-        except httpx.HTTPStatusError as exc:
-            body = exc.response.text if exc.response is not None else ""
-            logger.warning(
-                "openai.asr_http_error status=%s body=%s",
-                exc.response.status_code if exc.response is not None else "?",
-                body[:500],
-                exc_info=True,
-            )
-        except httpx.HTTPError as exc:
-            logger.warning("openai.asr_transport_error %s", exc, exc_info=True)
-        return None
-
-    async def _disable_remote(self, reason: str) -> None:
-        if not self._http:
-            return
-        await self._http.aclose()
-        self._http = None
-        self.recorder.log("ASR", "deepgram_remote_disabled", reason=reason)
-
-
-class OpenAIRealtimeClient:
+class OpenAIResponsesClient:
     def __init__(self, planner: AgentPlanner, dispatcher: ToolDispatcher, recorder: FlightRecorder) -> None:
         self.planner = planner
         self.dispatcher = dispatcher
         self.recorder = recorder
         self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
-        self.voice = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
-        self.sample_rate = int(os.getenv("OPENAI_REALTIME_SAMPLE_RATE", "16000"))
+        self.model = os.getenv("OPENAI_RESPONSES_MODEL", os.getenv("OPENAI_MODEL", "gpt-5"))
         self.system_prompt = os.getenv(
-            "OPENAI_REALTIME_SYSTEM_PROMPT",
+            "OPENAI_SYSTEM_PROMPT",
             "You are a helpful leasing assistant for luxury apartment tours. "
             "Answer succinctly and keep a welcoming tone.",
         )
+        self._http: Optional[httpx.AsyncClient] = None
+        if self.api_key:
+            self._http = httpx.AsyncClient(
+                base_url="https://api.openai.com/v1",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=httpx.Timeout(20.0, connect=5.0),
+            )
 
     async def infer(self, transcript: RealtimeTranscript) -> AgentResponse:
-        if not self.api_key:
+        if not self._http:
             self.recorder.log("PLAN", "openai_missing_api_key")
             text_response = await self.planner.process_transcript(transcript.transcript)
             return AgentResponse(text=text_response.get("text", ""), barge_in=False)
 
+        payload = {
+            "model": self.model,
+            "instructions": self.system_prompt,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": transcript.transcript}],
+                }
+            ],
+            "tools": self.dispatcher.get_tool_schemas(),
+        }
+
         try:
-            return await self._infer_via_realtime(transcript.transcript)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("openai.realtime_failure", error=str(exc))
-            self.recorder.log("PLAN", "openai_realtime_error", error=str(exc))
+            with self.recorder.stage("PLAN", provider="openai"):
+                response = await self._http.post("/responses", json=payload)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text if exc.response is not None else ""
+            logger.warning(
+                "openai.responses_http_error status=%s body=%s",
+                exc.response.status_code if exc.response is not None else "?",
+                body[:500],
+                exc_info=True,
+            )
+            self.recorder.log("PLAN", "openai_responses_error", status=exc.response.status_code if exc.response else "?", body=body[:200])
+            text_response = await self.planner.process_transcript(transcript.transcript)
+            return AgentResponse(text=text_response.get("text", ""), barge_in=False)
+        except httpx.HTTPError as exc:
+            logger.warning("openai.responses_transport_error %s", exc, exc_info=True)
+            self.recorder.log("PLAN", "openai_responses_transport_error", error=str(exc))
             text_response = await self.planner.process_transcript(transcript.transcript)
             return AgentResponse(text=text_response.get("text", ""), barge_in=False)
 
-    async def synthesize_text(self, text: str) -> bytes:
-        if not self.api_key:
-            return b""
-        uri = f"wss://api.openai.com/v1/realtime?model={self.model}"
-        headers = [
-            ("Authorization", f"Bearer {self.api_key}"),
-            ("OpenAI-Beta", "realtime=v1"),
-        ]
-        try:
-            async with websockets.connect(uri, additional_headers=headers) as ws:
-                await self._initialize_session(ws)
-                request = {
-                    "type": "response.create",
-                    "response": {
-                        "conversation": "none",
-                        "modalities": ["audio", "text"],
-                        "instructions": f"Please say exactly: {text}",
-                    },
-                }
-                await ws.send(json.dumps(request))
-                captured = await self._collect_response(ws)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("openai.realtime_tts_failure", error=str(exc))
-            self.recorder.log("PLAN", "openai_realtime_tts_error", error=str(exc))
-            return b""
-
-        if not captured.audio_pcm:
-            return b""
-        return _pcm_to_mulaw(captured.audio_pcm, captured.sample_rate or self.sample_rate)
-
-    async def _infer_via_realtime(self, user_text: str) -> AgentResponse:
-        uri = f"wss://api.openai.com/v1/realtime?model={self.model}"
-        headers = [
-            ("Authorization", f"Bearer {self.api_key}"),
-            ("OpenAI-Beta", "realtime=v1"),
-        ]
-        async with websockets.connect(uri, additional_headers=headers) as ws:
-            await self._initialize_session(ws)
-            await self._send_user_message(ws, user_text)
-            await self._request_response(ws)
-            captured = await self._collect_response(ws)
-
-        audio_b64 = None
-        if captured.audio_pcm:
-            audio_mulaw = _pcm_to_mulaw(captured.audio_pcm, captured.sample_rate or self.sample_rate)
-            audio_b64 = base64.b64encode(audio_mulaw).decode()
-
-        return AgentResponse(
-            text=captured.text.strip(),
-            barge_in=False,
-            tts_audio_b64=audio_b64,
-            tool_calls=captured.tool_calls,
-        )
-
-    async def _initialize_session(self, ws: websockets.WebSocketClientProtocol) -> None:
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "model": self.model,
-                "instructions": self.system_prompt,
-                "voice": self.voice,
-                "output_audio_format": "pcm16",
-            },
-        }
-        await ws.send(json.dumps(session_update))
-
-    async def _send_user_message(self, ws: websockets.WebSocketClientProtocol, text: str) -> None:
-        message = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": text}],
-            },
-        }
-        await ws.send(json.dumps(message))
-
-    async def _request_response(self, ws: websockets.WebSocketClientProtocol) -> None:
-        request = {
-            "type": "response.create",
-            "response": {
-                "modalities": ["audio", "text"],
-                "instructions": "Respond to the latest guest utterance.",
-            },
-        }
-        await ws.send(json.dumps(request))
-
-    async def _collect_response(self, ws: websockets.WebSocketClientProtocol) -> "RealtimeCapture":
+        data = response.json()
         text_chunks: List[str] = []
-        audio_chunks: List[bytes] = []
         tool_calls: List[ToolCallRequest] = []
-        sample_rate: Optional[int] = None
+        for item in data.get("output", []):
+            if item.get("type") == "message":
+                for content in item.get("content", []):
+                    if content.get("type") == "output_text":
+                        text_chunks.append(content.get("text", ""))
+                    elif content.get("type") == "tool_call":
+                        arguments = content.get("arguments") or {}
+                        tool_calls.append(
+                            ToolCallRequest(
+                                name=content.get("name", ""),
+                                arguments=arguments,
+                                call_id=content.get("call_id", content.get("id", "tool_call")),
+                            )
+                        )
 
-        while True:
-            raw = await ws.recv()
-            payload = json.loads(raw)
-            event_type = payload.get("type")
-
-            payload_for_log = payload
-            if event_type == "response.output_audio.delta" and payload.get("delta"):
-                payload_for_log = {**payload, "delta": f"<b64 {len(payload['delta'])} chars>"}
-            elif event_type == "response.output_audio.delta" and payload.get("audio"):
-                payload_for_log = {**payload, "audio": f"<b64 {len(payload['audio'])} chars>"}
-            elif event_type == "response.output_audio.done" and payload.get("audio"):
-                payload_for_log = {**payload, "audio": f"<b64 {len(payload['audio'])} chars>"}
-            logger.debug("openai.realtime_event type=%s payload=%s", event_type, payload_for_log)
-
-            if event_type == "response.output_text.delta":
-                text_chunks.append(payload.get("delta", ""))
-            elif event_type == "response.output_text.done":
-                continue
-            elif event_type == "response.output_audio.delta":
-                audio_b64 = payload.get("audio") or payload.get("delta")
-                if audio_b64:
-                    audio_chunks.append(base64.b64decode(audio_b64))
-                if payload.get("sample_rate"):
-                    sample_rate = int(payload["sample_rate"])
-            elif event_type == "response.output_tool_call.delta":
-                tool_name = payload.get("name")
-                arguments = payload.get("arguments", {})
-                call_id = payload.get("id", "tool-call")
-                tool_calls.append(ToolCallRequest(name=tool_name or "", arguments=arguments, call_id=call_id))
-            elif event_type == "response.completed":
-                break
-            elif event_type == "error":
-                logger.error("openai.realtime_error_event payload=%s", payload)
-                raise RuntimeError(payload.get("error", {}).get("message", "openai realtime error"))
-
-        return RealtimeCapture(
-            text="".join(text_chunks),
-            audio_pcm=b"".join(audio_chunks),
-            sample_rate=sample_rate,
-            tool_calls=tool_calls,
-        )
+        text = " ".join(text_chunks).strip()
+        return AgentResponse(text=text, barge_in=False, tool_calls=tool_calls)
 
 
-@dataclass
-class RealtimeCapture:
-    text: str
-    audio_pcm: bytes
-    sample_rate: Optional[int]
-    tool_calls: List[ToolCallRequest]
+class ElevenLabsClient:
+    def __init__(self, recorder: FlightRecorder) -> None:
+        self.recorder = recorder
+        self.api_key = os.getenv("ELEVENLABS_API_KEY")
+        self.voice_id = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+        self._client: Optional[ElevenLabs] = None
+        if self.api_key:
+            self._client = ElevenLabs(api_key=self.api_key)
+
+    async def synthesize(self, text: str) -> bytes:
+        if not text:
+            return b""
+        if not self._client:
+            self.recorder.log("PLAN", "tts_stubbed")
+            return _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
+        
+        try:
+            with self.recorder.stage("PLAN", provider="elevenlabs"):
+                # Use the official SDK's generate method with streaming
+                audio_generator = self._client.generate(
+                    text=text,
+                    voice=self.voice_id,
+                    model="eleven_turbo_v2_5",  # Fast model for real-time use
+                    voice_settings={
+                        "stability": 0.5,
+                        "similarity_boost": 0.75,
+                    },
+                    output_format="ulaw_8000",  # Twilio-compatible format
+                    stream=True
+                )
+                
+                # Collect all audio chunks
+                audio_chunks = []
+                def _sync_collect():
+                    for chunk in audio_generator:
+                        if chunk:
+                            audio_chunks.append(chunk)
+                
+                # Run the synchronous generator in a thread
+                await asyncio.to_thread(_sync_collect)
+                audio_bytes = b"".join(audio_chunks)
+                
+            self.recorder.log("PLAN", "tts_generated", provider="elevenlabs", bytes=len(audio_bytes))
+            return audio_bytes
+            
+        except Exception as exc:
+            logger.warning("elevenlabs.tts_error %s", exc, exc_info=True)
+            self.recorder.log("PLAN", "tts_error", provider="elevenlabs", error=str(exc))
+            return b""
+
+    async def close(self) -> None:
+        # The official SDK client doesn't require explicit closing
+        self._client = None
 
 
 class RealtimeLoop:
@@ -373,7 +300,8 @@ class RealtimeLoop:
         self.dispatcher = ToolDispatcher(recorder)
         self.planner = AgentPlanner(self.dispatcher, recorder)
         self.deepgram = DeepgramClient(recorder)
-        self.openai = OpenAIRealtimeClient(self.planner, self.dispatcher, recorder)
+        self.openai = OpenAIResponsesClient(self.planner, self.dispatcher, recorder)
+        self.elevenlabs = ElevenLabsClient(recorder)
         self.call_sid: Optional[str] = None
         self.stream_sid: Optional[str] = None
 
@@ -394,9 +322,15 @@ class RealtimeLoop:
             audio_b64 = payload.media.get("payload")
             if audio_b64:
                 audio_bytes = base64.b64decode(audio_b64)
+                self.recorder.log("ASR", "media_received", audio_bytes=len(audio_bytes), b64_length=len(audio_b64))
                 transcript = await self.deepgram.transcribe_chunk(audio_bytes)
                 if transcript:
+                    self.recorder.log("ASR", "transcript_ready", text=transcript.transcript[:100])
                     await self._handle_transcript(transcript, websocket)
+                else:
+                    self.recorder.log("ASR", "no_transcript_yet", buffer_size=len(self.deepgram.audio_buffer))
+            else:
+                self.recorder.log("ASR", "media_no_payload", media_keys=list(payload.media.keys()) if payload.media else [])
             return
         if payload.event == "mark" and payload.mark:
             mark_name = payload.mark.get("name")
@@ -419,7 +353,7 @@ class RealtimeLoop:
             return
         if not infer:
             self.recorder.log("PLAN", "direct_text", text=text)
-            audio_bytes = await self._synthesize_with_timeout(text, timeout_sec=2.0)
+            audio_bytes = await self.elevenlabs.synthesize(text)
             if not audio_bytes:
                 audio_bytes = _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
             await self._send_twilio_agent_events(text, audio_bytes, websocket)
@@ -449,7 +383,7 @@ class RealtimeLoop:
             except Exception:  # noqa: BLE001
                 audio_bytes = b""
         else:
-            audio_bytes = await self._synthesize_with_timeout(agent_response.text or "", timeout_sec=4.0)
+            audio_bytes = await self.elevenlabs.synthesize(agent_response.text or "")
         if not audio_bytes:
             audio_bytes = _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
         await self._send_twilio_agent_events(agent_response.text, audio_bytes, websocket)
@@ -506,8 +440,8 @@ class RealtimeLoop:
                         "media": {"payload": payload_b64},
                     }
                 )
-                # Pace frames at ~20ms per chunk to approximate real-time playback
-                await asyncio.sleep(0.02)
+                # Pace frames at ~10ms per chunk for faster playback and prevent timeouts
+                await asyncio.sleep(0.01)
                 frames_sent += 1
             logger.info("realtime.audio_frames_sent", frames=frames_sent, bytes=len(audio_bytes))
         else:
@@ -535,18 +469,6 @@ class RealtimeLoop:
             else:
                 summaries.append(f"{result.name} result: {result.output}")
         return " ".join(summaries).strip()
-
-
-    async def _synthesize_with_timeout(self, text: str, timeout_sec: float) -> bytes:
-        if not text:
-            return b""
-        try:
-            return await asyncio.wait_for(self.openai.synthesize_text(text), timeout=timeout_sec)
-        except asyncio.TimeoutError:
-            logger.warning("tts.timeout timeout=%s", timeout_sec)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("tts.error %s", exc)
-        return b""
 
 
 def _mulaw_to_pcm16(mulaw_bytes: bytes) -> bytes:
@@ -603,11 +525,3 @@ def _generate_mulaw_tone(duration_s: float, freq_hz: float = 440.0, sample_rate:
 
     ulaw_bytes = bytes(linear_to_mulaw(s) for s in pcm16)
     return ulaw_bytes
-
-
-def _pcm_to_mulaw(pcm_bytes: bytes, sample_rate: int) -> bytes:
-    if not pcm_bytes:
-        return b""
-    if sample_rate != 8000:
-        pcm_bytes, _ = audioop.ratecv(pcm_bytes, 2, 1, sample_rate, 8000, None)
-    return audioop.lin2ulaw(pcm_bytes, 2)
