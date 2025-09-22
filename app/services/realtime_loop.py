@@ -96,11 +96,14 @@ class DeepgramClient:
                             timestamp=datetime.now(timezone.utc),
                         )
                         self._transcript_queue.append(transcript)
-                        print(f"🎤 Streaming transcript: '{transcript_text}' (confidence: {confidence:.2f})")
+                        print(f"🎤 TRANSCRIPT: '{transcript_text}' (confidence: {confidence:.2f})")
             
             def handle_error(self_dg, error, **kwargs):
                 print(f"❌ Deepgram streaming error: {error}")
                 self.recorder.log("ASR", "streaming_error", error=str(error))
+                # Mark connection as failed for auto-restart
+                self._is_connected = False
+                self._connection = None
             
             # Register handlers using method call syntax
             self._connection.on(LiveTranscriptionEvents.Transcript, handle_transcript)
@@ -115,35 +118,36 @@ class DeepgramClient:
                 encoding="mulaw",
                 sample_rate=8000,
                 channels=1,
-                interim_results=True,
-                endpointing=300,  # 300ms pause detection
+                interim_results=False,  # Only final results for stability
+                endpointing=1000,  # 1 second pause detection for phone calls
             )
             
             self._connection.start(options)
             print("🔗 Deepgram streaming connection started")
             self.recorder.log("ASR", "streaming_started")
+            self._is_connected = True
             
         except Exception as e:
             print(f"❌ Failed to start Deepgram streaming: {e}")
             self.recorder.log("ASR", "streaming_start_error", error=str(e))
 
     async def transcribe_chunk(self, audio_chunk: bytes) -> Optional[RealtimeTranscript]:
-        """Send audio chunk to streaming connection and check for transcripts"""
+        """Robust streaming transcription with auto-reconnection"""
         if not self._client:
-            if not self._no_asr_warned:
-                self.recorder.log("ASR", "no_deepgram_client_available")
-                self._no_asr_warned = True
+            self.recorder.log("ASR", "no_deepgram_client_available")
+        if not self._no_asr_warned:
+            self._no_asr_warned = True
             return None
             
-        # Start streaming connection if not already started
-        if not self._connection:
+        # Ensure streaming connection is active
+        if not self._connection or not self._is_connected:
             await self.start_streaming()
             
-        if self._connection:
-            # Send audio chunk directly to streaming connection
+        # Send audio chunk to streaming connection
+        if self._connection and self._is_connected:
             try:
                 self._connection.send(audio_chunk)
-                self.recorder.log("ASR", "chunk_sent_streaming", chunk_size=len(audio_chunk))
+                self._last_audio_time = datetime.now()
                 
                 # Check for any new transcripts
                 if self._transcript_queue:
@@ -151,8 +155,11 @@ class DeepgramClient:
                     return transcript
                     
             except Exception as e:
-                print(f"❌ Error sending audio to Deepgram: {e}")
+                print(f"❌ Error sending audio: {e}")
                 self.recorder.log("ASR", "streaming_send_error", error=str(e))
+                # Mark for reconnection
+                self._is_connected = False
+                self._connection = None
                 
         return None
 
@@ -355,7 +362,7 @@ class RealtimeLoop:
             start_payload = payload.start or {}
             self.call_sid = start_payload.get("callSid") or start_payload.get("streamSid")
             self.stream_sid = start_payload.get("streamSid") or payload.streamSid
-            logger.info("realtime.call_started", call_sid=self.call_sid, stream_sid=self.stream_sid)
+            logger.info("realtime.call_started call_sid=%s stream_sid=%s", self.call_sid, self.stream_sid)
             # Proactive greeting so caller hears something immediately
             await self._handle_text(
                 "Hi! Which building are you interested in touring from our portfolio?",
@@ -370,10 +377,12 @@ class RealtimeLoop:
                 self.recorder.log("ASR", "media_received", audio_bytes=len(audio_bytes), b64_length=len(audio_b64))
                 transcript = await self.deepgram.transcribe_chunk(audio_bytes)
                 if transcript:
+                    print(f"🎯 Processing transcript: '{transcript.transcript}'")
                     self.recorder.log("ASR", "transcript_ready", text=transcript.transcript[:100])
                     await self._handle_transcript(transcript, websocket)
+                    print(f"✅ Transcript processed successfully")
                 else:
-                    self.recorder.log("ASR", "no_transcript_yet", buffer_size=len(self.deepgram.audio_buffer))
+                    self.recorder.log("ASR", "no_transcript_yet", buffer_size=0)
             else:
                 self.recorder.log("ASR", "media_no_payload", media_keys=list(payload.media.keys()) if payload.media else [])
             return
@@ -394,7 +403,7 @@ class RealtimeLoop:
                         await self._handle_transcript(final_transcript, websocket)
             return
         if payload.event == "stop":
-            logger.info("realtime.call_stopped", call_sid=self.call_sid)
+            logger.info("realtime.call_stopped call_sid=%s", self.call_sid)
             # Close streaming connection and get final transcript
             final_transcript = await self.deepgram.finalize()
             if final_transcript:
@@ -418,11 +427,18 @@ class RealtimeLoop:
 
     async def _handle_transcript(self, transcript: RealtimeTranscript, websocket: WebSocket) -> None:
         if not transcript.transcript:
+            print("❌ Empty transcript, skipping")
             return
+            
+        print(f"🤖 AGENT THINKING: '{transcript.transcript}'")
+        
         with self.recorder.stage("PLAN", transcript=transcript.transcript):
             agent_response = await self.openai.infer(transcript)
+            
+        print(f"💭 AGENT RESPONSE: '{agent_response.text}'")
 
         if agent_response.tool_calls:
+            print(f"🔧 Executing {len(agent_response.tool_calls)} tool calls")
             tool_results = await self._execute_tool_calls(agent_response.tool_calls)
             if tool_results:
                 summary = self._render_tool_results(tool_results)
@@ -430,8 +446,10 @@ class RealtimeLoop:
                     agent_response.text = f"{agent_response.text} {summary}".strip()
                 else:
                     agent_response.text = summary
+                print(f"🔧 Tool results: '{summary}'")
 
         # Synthesize audio suitable for Twilio (8kHz mu-law) and stream back
+        print(f"🗣️ Synthesizing audio for: '{agent_response.text}'")
         if agent_response.tts_audio_b64:
             try:
                 audio_bytes = base64.b64decode(agent_response.tts_audio_b64)
@@ -440,8 +458,12 @@ class RealtimeLoop:
         else:
             audio_bytes = await self.elevenlabs.synthesize(agent_response.text or "")
         if not audio_bytes:
+            print("⚠️ No audio generated, using tone")
             audio_bytes = _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
+            
+        print(f"📡 Sending response to Twilio: {len(audio_bytes)} bytes")
         await self._send_twilio_agent_events(agent_response.text, audio_bytes, websocket)
+        print(f"✅ Response sent successfully")
 
     async def _execute_tool_calls(self, tool_calls: List[ToolCallRequest]) -> List[ToolCallResult]:
         results: List[ToolCallResult] = []
@@ -498,7 +520,7 @@ class RealtimeLoop:
                 # Pace frames at ~10ms per chunk for faster playback and prevent timeouts
                 await asyncio.sleep(0.01)
                 frames_sent += 1
-            logger.info("realtime.audio_frames_sent", frames=frames_sent, bytes=len(audio_bytes))
+            logger.info("realtime.audio_frames_sent frames=%d bytes=%d", frames_sent, len(audio_bytes))
         else:
             logger.warning("realtime.audio_empty")
         await websocket.send_json(

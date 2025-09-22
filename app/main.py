@@ -4,6 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import health, twilio, ws
 from app.logging.flight_recorder import register_log_middleware
 
+# Import and setup demo logging
+try:
+    import logging_config
+    logging_config.setup_demo_logging()
+except ImportError:
+    pass  # logging_config is optional
+
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Touring Agent", version="0.1.0")
