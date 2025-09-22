@@ -13,7 +13,7 @@ from typing import Any, List, Optional
 
 import logging
 import httpx
-from deepgram import DeepgramClient as SDKDeepgramClient, FileSource, PrerecordedOptions
+from deepgram import DeepgramClient as SDKDeepgramClient, LiveOptions, LiveTranscriptionEvents
 from elevenlabs.client import ElevenLabs
 from elevenlabs import stream
 from fastapi import WebSocket
@@ -32,58 +32,128 @@ class DeepgramClient:
         self.audio_buffer = bytearray()
         self.api_key = os.getenv("DEEPGRAM_API_KEY")
         self._client: Optional[SDKDeepgramClient] = None
-        self._options: Optional[PrerecordedOptions] = None
+        self._connection = None
+        self._latest_transcript = None
+        self._transcript_queue = []
         if self.api_key:
             self._client = SDKDeepgramClient(self.api_key)
-            model = os.getenv("DEEPGRAM_MODEL", "nova-3")  # Use latest model from docs
-            self._options = PrerecordedOptions(
-                model=model,
+        self._min_flush_bytes = 800  # Smaller chunks for streaming
+        self._no_asr_warned = False
+
+    def _has_voice_activity(self, audio_data: bytes) -> bool:
+        """Simple Voice Activity Detection for μ-law audio"""
+        if len(audio_data) < 160:
+            return False
+            
+        # μ-law silence is typically 0xFF (255) or 0x7F (127)
+        silence_values = {0x00, 0x7F, 0xFF}
+        
+        # Calculate voice activity metrics
+        unique_values = len(set(audio_data))
+        non_silence_count = sum(1 for b in audio_data if b not in silence_values)
+        
+        # Calculate energy/amplitude variation
+        if len(audio_data) > 1:
+            # Check for amplitude variation (sign of speech)
+            amplitude_changes = 0
+            for i in range(1, len(audio_data)):
+                if abs(audio_data[i] - audio_data[i-1]) > 10:  # Significant change
+                    amplitude_changes += 1
+        else:
+            amplitude_changes = 0
+            
+        # More sophisticated VAD thresholds
+        variation_threshold = len(audio_data) * 0.05  # At least 5% non-silence (lowered)
+        energy_threshold = 3  # At least 3 unique values (lowered)
+        change_threshold = len(audio_data) * 0.02  # At least 2% amplitude changes
+        
+        has_variation = non_silence_count > variation_threshold
+        has_energy = unique_values > energy_threshold  
+        has_changes = amplitude_changes > change_threshold
+        
+        # More lenient: any two of the three conditions
+        voice_indicators = sum([has_variation, has_energy, has_changes])
+        return voice_indicators >= 2
+
+    async def start_streaming(self) -> None:
+        """Initialize Deepgram streaming connection using correct syntax from docs"""
+        if not self._client:
+            return
+            
+        try:
+            # Create streaming connection
+            self._connection = self._client.listen.websocket.v("1")
+            
+            # Define handlers with correct signatures (SDK passes 'self' as first arg)
+            def handle_transcript(self_dg, result, **kwargs):
+                if result.channel.alternatives:
+                    transcript_text = result.channel.alternatives[0].transcript
+                    confidence = result.channel.alternatives[0].confidence
+                    if transcript_text.strip():  # Only process non-empty transcripts
+                        transcript = RealtimeTranscript(
+                            transcript=transcript_text,
+                            confidence=confidence,
+                            timestamp=datetime.now(timezone.utc),
+                        )
+                        self._transcript_queue.append(transcript)
+                        print(f"🎤 Streaming transcript: '{transcript_text}' (confidence: {confidence:.2f})")
+            
+            def handle_error(self_dg, error, **kwargs):
+                print(f"❌ Deepgram streaming error: {error}")
+                self.recorder.log("ASR", "streaming_error", error=str(error))
+            
+            # Register handlers using method call syntax
+            self._connection.on(LiveTranscriptionEvents.Transcript, handle_transcript)
+            self._connection.on(LiveTranscriptionEvents.Error, handle_error)
+            
+            # Start connection with streaming options (exact syntax from docs)
+            options = LiveOptions(
+                model=os.getenv("DEEPGRAM_MODEL", "nova-3"),
+                language="en-US",
                 smart_format=True,
                 punctuate=True,
                 encoding="mulaw",
                 sample_rate=8000,
                 channels=1,
+                interim_results=True,
+                endpointing=300,  # 300ms pause detection
             )
-        self._min_flush_bytes = 800  # Even faster response for better UX
-        self._no_asr_warned = False
+            
+            self._connection.start(options)
+            print("🔗 Deepgram streaming connection started")
+            self.recorder.log("ASR", "streaming_started")
+            
+        except Exception as e:
+            print(f"❌ Failed to start Deepgram streaming: {e}")
+            self.recorder.log("ASR", "streaming_start_error", error=str(e))
 
     async def transcribe_chunk(self, audio_chunk: bytes) -> Optional[RealtimeTranscript]:
-        self.audio_buffer.extend(audio_chunk)
-        self.recorder.log("ASR", "chunk_received", chunk_size=len(audio_chunk), buffer_total=len(self.audio_buffer))
-# Debug: print(f"🎤 Audio chunk: {len(audio_chunk)} bytes, buffer total: {len(self.audio_buffer)} bytes")
-        
-        if self._client and self._options:
-            if len(self.audio_buffer) < self._min_flush_bytes:
-                self.recorder.log("ASR", "buffer_too_small", current=len(self.audio_buffer), needed=self._min_flush_bytes)
-                return None
-            # Analyze audio data before sending to Deepgram
-            audio_data = bytes(self.audio_buffer)
-            unique_values = len(set(audio_data))
-            non_silence_bytes = sum(1 for b in audio_data if b not in [0x00, 0xFF])
+        """Send audio chunk to streaming connection and check for transcripts"""
+        if not self._client:
+            if not self._no_asr_warned:
+                self.recorder.log("ASR", "no_deepgram_client_available")
+                self._no_asr_warned = True
+            return None
             
-            # Calculate some basic audio statistics
-            avg_value = sum(audio_data) / len(audio_data) if audio_data else 0
-            min_value = min(audio_data) if audio_data else 0
-            max_value = max(audio_data) if audio_data else 0
+        # Start streaming connection if not already started
+        if not self._connection:
+            await self.start_streaming()
             
-            print(f"🔄 Transcribing {len(self.audio_buffer)} bytes: {unique_values} unique values, {non_silence_bytes} speech bytes")
-            
-            # Audio sample debugging (disabled)
-            # if needed for debugging, uncomment the file saving logic
-            
-            self.recorder.log("ASR", "deepgram_flush", buffered=len(self.audio_buffer))
-            result = await self._flush_deepgram()
-            if result:
-                print(f"✅ Transcript: '{result.transcript}' (confidence: {result.confidence:.2f})")
-            else:
-                print("❌ No speech detected")
-            return result
-        
-        if not self._no_asr_warned:
-            print("❌ No Deepgram client available!")
-            self.recorder.log("ASR", "no_deepgram_client_available")
-            self._no_asr_warned = True
-        self.audio_buffer.clear()
+        if self._connection:
+            # Send audio chunk directly to streaming connection
+            try:
+                self._connection.send(audio_chunk)
+                self.recorder.log("ASR", "chunk_sent_streaming", chunk_size=len(audio_chunk))
+                
+                # Check for any new transcripts
+                if self._transcript_queue:
+                    transcript = self._transcript_queue.pop(0)
+                    return transcript
+                    
+            except Exception as e:
+                print(f"❌ Error sending audio to Deepgram: {e}")
+                self.recorder.log("ASR", "streaming_send_error", error=str(e))
+                
         return None
 
     async def push_text(self, text: str) -> RealtimeTranscript:
@@ -96,64 +166,39 @@ class DeepgramClient:
         return transcript
 
     async def finalize(self) -> Optional[RealtimeTranscript]:
-        if not self.audio_buffer:
-            return None
-        if self._client and self._options:
-            return await self._flush_deepgram()
-        self.audio_buffer.clear()
-        return None
-
-    async def _flush_deepgram(self) -> Optional[RealtimeTranscript]:
-        if not self._client or not self._options:
-            return None
-        payload = bytes(self.audio_buffer)
-        self.audio_buffer.clear()
-        file_source: FileSource = {"buffer": payload}
-
-        try:
-            def _sync_transcribe() -> dict[str, Any]:
-                response = self._client.listen.rest.v("1").transcribe_file(
-                    file_source,
-                    self._options,
-                )
-                return response.to_dict() if hasattr(response, "to_dict") else response
-
-            with self.recorder.stage("ASR", bytes=len(payload)):
-                data = await asyncio.to_thread(_sync_transcribe)
-                self.recorder.log("ASR", "deepgram_raw_response", response=str(data)[:500])
-                # Debug: print(f"🔍 Deepgram response: {data}")
+        """Finalize streaming connection and get final transcript"""
+        if self._connection:
+            try:
+                # Send any remaining audio
+                if self.audio_buffer:
+                    self._connection.send(bytes(self.audio_buffer))
+                    self.audio_buffer.clear()
                 
-                # Check confidence and alternatives  
-                channels = data.get("results", {}).get("channels", [])
-                if channels:
-                    alternatives = channels[0].get("alternatives", [])
-                    # Debug: print(f"📊 Alternatives found: {len(alternatives)}")
-                    # for i, alt in enumerate(alternatives):
-                    #     print(f"  Alt {i}: '{alt.get('transcript', '')}' (confidence: {alt.get('confidence', 0)})")
-
-            transcript_text = (
-                data.get("results", {})
-                .get("channels", [{}])[0]
-                .get("alternatives", [{}])[0]
-                .get("transcript", "")
-            )
-            if transcript_text:
-                transcript = RealtimeTranscript(
-                    transcript=transcript_text,
-                    confidence=
-                    data.get("results", {})
-                    .get("channels", [{}])[0]
-                    .get("alternatives", [{}])[0]
-                    .get("confidence", 0.9),
-                    timestamp=datetime.now(timezone.utc),
-                )
-                self.recorder.log("ASR", "deepgram_transcript", transcript=transcript.transcript)
-                return transcript
-            self.recorder.log("ASR", "deepgram_empty_transcript", payload=data)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("deepgram.sdk_error %s", exc, exc_info=True)
-            self.recorder.log("ASR", "deepgram_sdk_error", error=str(exc))
+                # Close connection to get final results
+                self._connection.finish()
+                print("🔗 Deepgram streaming connection closed")
+                self.recorder.log("ASR", "streaming_finished")
+                
+                # Return any remaining transcript
+                if self._transcript_queue:
+                    return self._transcript_queue.pop(0)
+                    
+            except Exception as e:
+                print(f"❌ Error finalizing Deepgram: {e}")
+                self.recorder.log("ASR", "streaming_finalize_error", error=str(e))
+        
+        self.audio_buffer.clear()
         return None
+
+    async def close(self) -> None:
+        """Close the streaming connection"""
+        if self._connection:
+            try:
+                self._connection.finish()
+                self._connection = None
+                print("🔗 Deepgram streaming connection closed")
+            except Exception as e:
+                print(f"⚠️ Error closing Deepgram connection: {e}")
 
 class OpenAIResponsesClient:
     def __init__(self, planner: AgentPlanner, dispatcher: ToolDispatcher, recorder: FlightRecorder) -> None:
@@ -340,12 +385,22 @@ class RealtimeLoop:
             elif mark_name == "gather":
                 gather_text = payload.mark.get("payload", {}).get("text", "")
                 await self._handle_text(gather_text, websocket)
+            elif mark_name == "force_transcription":
+                # Manual trigger for transcription when VAD fails
+                print("🔧 Manual transcription triggered")
+                if len(self.deepgram.audio_buffer) > 0:
+                    final_transcript = await self.deepgram.finalize()
+                    if final_transcript:
+                        await self._handle_transcript(final_transcript, websocket)
             return
         if payload.event == "stop":
             logger.info("realtime.call_stopped", call_sid=self.call_sid)
+            # Close streaming connection and get final transcript
             final_transcript = await self.deepgram.finalize()
             if final_transcript:
                 await self._handle_transcript(final_transcript, websocket)
+            # Cleanup streaming connection
+            await self.deepgram.close()
             return
 
     async def _handle_text(self, text: str, websocket: WebSocket, *, infer: bool = True) -> None:
