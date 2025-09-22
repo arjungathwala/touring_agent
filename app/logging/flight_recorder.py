@@ -18,6 +18,7 @@ _STAGE_ORDER = [
     "NER",
     "BOOK_TOUR",
     "SMS",
+    "WS",
 ]
 
 
@@ -37,7 +38,7 @@ class FlightRecorder:
     @contextmanager
     def stage(self, stage: str, **metadata: Any):
         if stage not in _STAGE_ORDER:
-            logger.warning("flight_recorder.unknown_stage", stage=stage)
+            logger.warning("flight_recorder.unknown_stage stage=%s", stage)
         stage_start = time.perf_counter()
         try:
             yield
@@ -51,17 +52,18 @@ class FlightRecorder:
                 metadata={"total_ms": round(total_ms, 2), **_redact(metadata)},
             )
             self.events.append(event)
+            redacted = _redact(metadata)
             logger.info(
-                "flight_recorder.stage",
-                stage=stage,
-                elapsed_ms=round(elapsed_ms, 2),
-                total_ms=round(total_ms, 2),
-                **_redact(metadata),
+                "flight_recorder.stage stage=%s elapsed_ms=%.2f total_ms=%.2f metadata=%s",
+                stage,
+                round(elapsed_ms, 2),
+                round(total_ms, 2),
+                redacted,
             )
 
     def log(self, stage: str, message: str, **metadata: Any) -> None:
         if stage not in _STAGE_ORDER:
-            logger.warning("flight_recorder.unknown_stage", stage=stage)
+            logger.warning("flight_recorder.unknown_stage stage=%s", stage)
         total_ms = (time.perf_counter() - self.start_time) * 1000
         event = StageEvent(
             stage=stage,
@@ -70,12 +72,13 @@ class FlightRecorder:
             metadata={"total_ms": round(total_ms, 2), **_redact(metadata)},
         )
         self.events.append(event)
+        redacted = _redact(metadata)
         logger.info(
-            "flight_recorder.log",
-            stage=stage,
-            message=message,
-            total_ms=round(total_ms, 2),
-            **_redact(metadata),
+            "flight_recorder.log stage=%s message=%s total_ms=%.2f metadata=%s",
+            stage,
+            message,
+            round(total_ms, 2),
+            redacted,
         )
 
 

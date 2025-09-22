@@ -18,8 +18,19 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
     realtime_loop = RealtimeLoop(recorder)
     try:
         while True:
-            raw = await websocket.receive_text()
-            payload = TwilioMediaPayload.model_validate(json.loads(raw))
-            await realtime_loop.handle_event(payload, websocket)
+            message = await websocket.receive()
+            message_type = message.get("type")
+            if message_type in {"websocket.disconnect", "websocket.close"}:
+                recorder.log("WS", "disconnect", code=message.get("code"))
+                break
+            if "text" in message and message["text"] is not None:
+                raw = message["text"]
+                payload = TwilioMediaPayload.model_validate(json.loads(raw))
+                await realtime_loop.handle_event(payload, websocket)
+            elif "bytes" in message and message["bytes"] is not None:
+                # Twilio may send binary frames in some scenarios; log and ignore safely
+                recorder.log("WS", "binary_ignored", bytes=len(message["bytes"]))
+            else:
+                recorder.log("WS", "unknown_message", keys=list(message.keys()))
     except WebSocketDisconnect:
         pass

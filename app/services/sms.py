@@ -4,6 +4,7 @@ import os
 from typing import Optional
 
 import logging
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +16,31 @@ class SmsClient:
         self.from_phone = from_phone or os.getenv("TWILIO_FROM_PHONE")
 
     async def send(self, to_phone: str, body: str) -> dict[str, str]:
-        # In the MVP environment we log instead of hitting Twilio directly
-        logger.info("sms.send", to_phone=_redact(to_phone), body_preview=body[:120])
-        # Integrate with Twilio API here when credentials are present
-        return {"status": "queued", "to": to_phone}
+        if not self.account_sid or not self.auth_token or not self.from_phone:
+            logger.info("sms.stub", to_phone=_redact(to_phone), body_preview=body[:120])
+            return {"status": "stubbed", "to": to_phone}
+
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{self.account_sid}/Messages.json"
+        payload = {
+            "To": to_phone,
+            "From": self.from_phone,
+            "Body": body,
+        }
+        auth = (self.account_sid, self.auth_token)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0), auth=auth) as client:
+                response = await client.post(url, data=payload)
+            response.raise_for_status()
+            data = response.json()
+            logger.info("sms.sent", to=_redact(to_phone), sid=data.get("sid"))
+            return {
+                "status": data.get("status", "queued"),
+                "to": data.get("to", to_phone),
+                "sid": data.get("sid"),
+            }
+        except httpx.HTTPError as exc:
+            logger.exception("sms.error to=%s err=%s", _redact(to_phone), exc)
+            return {"status": "error", "to": to_phone, "error": str(exc)}
 
 
 def _redact(phone: str) -> str:

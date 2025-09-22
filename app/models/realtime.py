@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,6 +27,7 @@ class AgentResponse(BaseModel):
     text: str
     barge_in: bool = False
     tts_audio_b64: Optional[str] = None
+    tool_calls: List["ToolCallRequest"] = Field(default_factory=list)
 
 
 class ToolCallRequest(BaseModel):
@@ -39,3 +40,6 @@ class ToolCallResult(BaseModel):
     call_id: str
     name: str
     output: Dict[str, Any]
+
+
+AgentResponse.model_rebuild()

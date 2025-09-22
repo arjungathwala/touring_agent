@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import logging
 from dateutil import parser as dateparser
 from dateutil import tz
 
 from app.logging.flight_recorder import FlightRecorder
-from app.models.tooling import AvailabilityQuery, SisterPropertyRouteRequest, TourRequest
+from app.models.tooling import AvailabilityQuery, NetEffectiveRentRequest, SisterPropertyRouteRequest, TourRequest
 from app.services.tool_dispatcher import ToolDispatcher
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class PlannerState:
     prospect_name: Optional[str] = None
     prospect_email: Optional[str] = None
     prospect_phone: Optional[str] = None
+    availability_cache: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class AgentPlanner:
@@ -39,11 +41,23 @@ class AgentPlanner:
         text = transcript.lower()
         response: Dict[str, str] = {"text": ""}
 
+        self._maybe_capture_contact(transcript)
+
         if not self.state.property_id:
             self._identify_property(text)
             if not self.state.property_id:
                 response["text"] = "Hi! Which building are you interested in touring from our portfolio?"
                 return response
+
+        policy_response = self._respond_with_policy(text)
+        if policy_response:
+            response["text"] = policy_response
+            return response
+
+        ner_response = self._respond_with_net_effective(text)
+        if ner_response:
+            response["text"] = ner_response
+            return response
 
         if not self.state.availability_shared:
             response["text"] = self._respond_with_availability()
@@ -109,9 +123,11 @@ class AgentPlanner:
     def _respond_with_availability(self) -> str:
         assert self.state.property_id
         args = AvailabilityQuery(property_id=self.state.property_id, bedrooms=self.state.desired_bedrooms)
-        availability = self.dispatcher.dispatch("check_availability", args.model_dump())
+        with self.recorder.stage("PLAN", property_id=self.state.property_id):
+            availability = self.dispatcher.dispatch("check_availability", args.model_dump())
         if availability:
             self.state.availability_shared = True
+            self.state.availability_cache = availability
             snippets = []
             for unit in availability[:2]:
                 rent = unit.get("rent")
@@ -134,7 +150,8 @@ class AgentPlanner:
             origin_property_id=self.state.property_id,
             bedrooms=self.state.desired_bedrooms,
         )
-        options: List[Dict[str, str]] = self.dispatcher.dispatch("route_to_sister_property", request.model_dump())
+        with self.recorder.stage("PLAN", origin=self.state.property_id):
+            options: List[Dict[str, str]] = self.dispatcher.dispatch("route_to_sister_property", request.model_dump())
         if not options:
             return "I don't have alternatives right now, but I can take your info and follow up."
         self.state.sister_route_offered = True
@@ -143,6 +160,7 @@ class AgentPlanner:
         self.state.property_name = top["name"]
         availability = top["available_units"]
         self.state.availability_shared = True
+        self.state.availability_cache = availability
         unit = availability[0]
         return (
             f"Nothing open there today, but {top['name']} is {top['distance_miles']} miles away with {unit['unit_id']} "
@@ -161,17 +179,86 @@ class AgentPlanner:
             prospect_email=self.state.prospect_email or "prospect@example.com",
             prospect_phone=self.state.prospect_phone or "+15555555555",
         )
-        confirmation = self.dispatcher.dispatch("book_tour", request.model_dump())
+        with self.recorder.stage("BOOK_TOUR", property_id=self.state.property_id):
+            confirmation = self.dispatcher.dispatch("book_tour", request.model_dump())
         sms_body = (
             f"You're confirmed for {self.state.property_name} on {tour_time.strftime('%A %b %d at %I:%M %p')}. "
             f"Confirmation ID {confirmation['booking_id']}."
         )
-        self.dispatcher.dispatch(
-            "send_sms",
-            {"to_phone": request.prospect_phone, "body": sms_body},
-        )
+        with self.recorder.stage("SMS", phone=request.prospect_phone):
+            self.dispatcher.dispatch(
+                "send_sms",
+                {"to_phone": request.prospect_phone, "body": sms_body},
+            )
         self.state.booked_confirmation = confirmation
         return confirmation
+
+    def _respond_with_policy(self, text: str) -> Optional[str]:
+        if "policy" not in text and "pet" not in text and "income" not in text:
+            return None
+        if not self.state.property_id:
+            return None
+        policy_type = None
+        if "pet" in text:
+            policy_type = "pet"
+        elif "income" in text or "guarantor" in text:
+            policy_type = "income"
+        request_args = {"property_id": self.state.property_id}
+        if policy_type:
+            request_args["policy_type"] = policy_type
+        with self.recorder.stage("POLICY", property_id=self.state.property_id, policy_type=policy_type or "all"):
+            policies = self.dispatcher.dispatch("check_policy", request_args)
+        if not policies:
+            return "I don't have those details handy, but I can follow up by text if you'd like."
+        fragments = []
+        for policy in policies[:2]:
+            description = policy.get("description")
+            label = policy.get("policy_type", "policy")
+            fragments.append(f"{label.title()}: {description}")
+        return (
+            "Here's what I show: " + " | ".join(fragments) + ". Ready to move forward with a tour?"
+        )
+
+    def _respond_with_net_effective(self, text: str) -> Optional[str]:
+        if "net effective" not in text and "concession" not in text:
+            return None
+        if not self.state.property_id:
+            return None
+        if not self.state.availability_cache:
+            self._respond_with_availability()
+        if not self.state.availability_cache:
+            return None
+        unit = self.state.availability_cache[0]
+        term = unit.get("term_months") or 12
+        request = NetEffectiveRentRequest(
+            property_id=self.state.property_id,
+            unit_id=unit["unit_id"],
+            term_months=term,
+        )
+        with self.recorder.stage("NER", unit_id=unit["unit_id"], term=term):
+            ner = self.dispatcher.dispatch("compute_net_effective_rent", request.model_dump())
+        if not ner:
+            return "I'm double checking concessions, one sec."
+        return (
+            f"That pencils out to ${ner['net_effective_rent']:,.0f} net effective on a {ner['term_months']} month term "
+            "after concessions. Want to pick a tour time?"
+        )
+
+    def _maybe_capture_contact(self, transcript: str) -> None:
+        if not self.state.prospect_email:
+            email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", transcript)
+            if email_match:
+                self.state.prospect_email = email_match.group(0)
+        if not self.state.prospect_phone:
+            phone_match = re.search(r"(\+?1[\s-]?)?(\d{3})[\s-]?(\d{3})[\s-]?(\d{4})", transcript)
+            if phone_match:
+                digits = "".join(filter(str.isdigit, phone_match.group(0)))
+                self.state.prospect_phone = f"+1{digits[-10:]}"
+        if not self.state.prospect_name:
+            name_match = re.search(r"my name is ([a-zA-Z\s]+)", transcript.lower())
+            if name_match:
+                name = name_match.group(1).strip().title()
+                self.state.prospect_name = name
 
 
 def _upcoming_weekday_delta(target_weekday: int) -> timedelta:

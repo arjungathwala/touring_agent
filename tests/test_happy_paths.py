@@ -38,7 +38,10 @@ def test_happy_path_match_and_book(tmp_path):
             )
         )
         response = ws.receive_json()
-        assert "21 West End" in response["text"]
+        assert response["event"] == "mark"
+        assert "21 West End" in response["mark"]["payload"]["text"]
+        ws.receive_json()  # media frame
+        ws.receive_json()  # completion mark
 
         ws.send_text(
             json.dumps(
@@ -53,8 +56,11 @@ def test_happy_path_match_and_book(tmp_path):
             )
         )
         response = ws.receive_json()
-        text = response["text"].lower()
+        assert response["event"] == "mark"
+        text = response["mark"]["payload"]["text"].lower()
         assert "book" in text
+        ws.receive_json()
+        ws.receive_json()
 
     assert tools._BOOKED_TOURS
     confirmation = next(iter(tools._BOOKED_TOURS.values()))
@@ -79,7 +85,10 @@ def test_happy_path_route_and_book():
             )
         )
         response = ws.receive_json()
-        assert "Hudson 360" in response["text"]
+        assert response["event"] == "mark"
+        assert "Hudson 360" in response["mark"]["payload"]["text"]
+        ws.receive_json()
+        ws.receive_json()
 
         ws.send_text(
             json.dumps(
@@ -94,8 +103,11 @@ def test_happy_path_route_and_book():
             )
         )
         response = ws.receive_json()
-        text = response["text"].lower()
+        assert response["event"] == "mark"
+        text = response["mark"]["payload"]["text"].lower()
         assert "book" in text
+        ws.receive_json()
+        ws.receive_json()
 
     confirmations = list(tools._BOOKED_TOURS.values())
     assert confirmations

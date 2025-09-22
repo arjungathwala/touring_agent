@@ -66,6 +66,7 @@ class TourConfirmation(BaseModel):
     property_id: str
     tour_time: datetime
     calendar_url: Optional[str]
+    m365_url: Optional[str] = None
     ics_path: Optional[str]
 
 

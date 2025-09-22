@@ -23,7 +23,7 @@ from app.models.tooling import (
     UnitSummary,
 )
 from app.services import calendar
-from app.services.portfolio import Property, Unit, get_property, iter_sister_properties, list_policies, list_units
+from app.services.portfolio import Unit, get_property, iter_sister_properties, list_policies, list_units
 from app.services.sms import SmsClient
 
 logger = logging.getLogger(__name__)
@@ -150,6 +150,7 @@ def book_tour(request: TourRequest, recorder: Optional[FlightRecorder] = None) -
         property_id=request.property_id,
         tour_time=request.tour_time,
         calendar_url=artifacts["google_link"],
+        m365_url=artifacts["m365_link"],
         ics_path=artifacts["ics_path"],
     )
     _BOOKED_TOURS[key] = confirmation
@@ -175,27 +176,24 @@ def send_sms(to_phone: str, body: str, recorder: Optional[FlightRecorder] = None
         logger.warning("sms.missing_phone")
         return result
 
-    if os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN"):
-        # When credentials are provided, send the actual SMS
-        client_result = {}
-        try:
-            # This call is asynchronous, but for the MVP we execute synchronously via loop.run_until_complete
-            import asyncio
+    import asyncio
 
-            client_result = asyncio.get_event_loop().run_until_complete(client.send(to_phone, body))
-        except RuntimeError:
-            # When there is no running loop we create a temporary one
-            import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
-            result_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(result_loop)
-            client_result = result_loop.run_until_complete(client.send(to_phone, body))
-            result_loop.close()
-            asyncio.set_event_loop(None)
-        result.update(client_result)
+    if loop and loop.is_running():
+        loop.create_task(client.send(to_phone, body))
+        result.update({"status": "queued"})
     else:
-        logger.info("sms.stub", to=_redact(to_phone), body_preview=body[:120])
-        result.update({"status": "stubbed"})
+        try:
+            result.update(asyncio.run(client.send(to_phone, body)))
+        except RuntimeError:
+            result.update({"status": "error", "error": "sms_send_failed"})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("sms.error to=%s err=%s", _redact(to_phone), exc)
+            result.update({"status": "error", "error": str(exc)})
 
     if recorder:
         recorder.log("SMS", "sms_sent", to=_redact(to_phone), status=result["status"])
