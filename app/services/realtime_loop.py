@@ -216,8 +216,10 @@ class OpenAIResponsesClient:
         self.model = os.getenv("OPENAI_RESPONSES_MODEL", os.getenv("OPENAI_MODEL", "gpt-5"))
         self.system_prompt = os.getenv(
             "OPENAI_SYSTEM_PROMPT",
-            "You are a helpful leasing assistant for luxury apartment tours. "
-            "Answer succinctly and keep a welcoming tone.",
+            "You are a persuasive leasing specialist whose primary goal is to book apartment tours. "
+            "Keep callers engaged, create urgency around availability, and guide every conversation toward booking a tour. "
+            "Use phrases like 'I can book you right now', 'these units move fast', 'let me lock in a time for you'. "
+            "Never let calls end without a booking attempt. Be friendly but persistent about scheduling tours.",
         )
         self._http: Optional[httpx.AsyncClient] = None
         if self.api_key:
@@ -234,7 +236,10 @@ class OpenAIResponsesClient:
         if not self._http:
             self.recorder.log("PLAN", "openai_missing_api_key")
             text_response = await self.planner.process_transcript(transcript.transcript)
-            return AgentResponse(text=text_response.get("text", ""), barge_in=False)
+            # Enable barge-in for longer responses
+            response_text = text_response.get("text", "")
+            enable_barge_in = len(response_text) > 100  # Enable for responses longer than 100 chars
+            return AgentResponse(text=response_text, barge_in=enable_barge_in)
 
         payload = {
             "model": self.model,
@@ -288,7 +293,9 @@ class OpenAIResponsesClient:
                         )
 
         text = " ".join(text_chunks).strip()
-        return AgentResponse(text=text, barge_in=False, tool_calls=tool_calls)
+        # Enable barge-in for longer responses or when tools are involved
+        enable_barge_in = len(text) > 100 or len(tool_calls) > 0
+        return AgentResponse(text=text, barge_in=enable_barge_in, tool_calls=tool_calls)
 
 
 class ElevenLabsClient:
@@ -356,6 +363,9 @@ class RealtimeLoop:
         self.elevenlabs = ElevenLabsClient(recorder)
         self.call_sid: Optional[str] = None
         self.stream_sid: Optional[str] = None
+        self._is_agent_speaking = False
+        self._barge_in_detected = False
+        self._current_response_task: Optional[asyncio.Task] = None
 
     async def handle_event(self, payload: TwilioMediaPayload, websocket: WebSocket) -> None:
         if payload.event == "start":
@@ -375,6 +385,14 @@ class RealtimeLoop:
             if audio_b64:
                 audio_bytes = base64.b64decode(audio_b64)
                 self.recorder.log("ASR", "media_received", audio_bytes=len(audio_bytes), b64_length=len(audio_b64))
+                
+                # Check for barge-in during agent responses
+                if self._is_agent_speaking:
+                    if await self._detect_barge_in(audio_bytes):
+                        await self._handle_barge_in(websocket)
+                        return
+                
+                # Normal transcript processing
                 transcript = await self.deepgram.transcribe_chunk(audio_bytes)
                 if transcript:
                     print(f"🎯 Processing transcript: '{transcript.transcript}'")
@@ -412,6 +430,45 @@ class RealtimeLoop:
             await self.deepgram.close()
             return
 
+    async def _detect_barge_in(self, audio_bytes: bytes) -> bool:
+        """Detect if human is speaking during agent response (barge-in)"""
+        # Use the same VAD logic as DeepgramClient
+        has_voice = self.deepgram._has_voice_activity(audio_bytes)
+        
+        if has_voice:
+            print("🚨 BARGE-IN detected!")
+            self.recorder.log("ASR", "barge_in_detected", audio_bytes=len(audio_bytes))
+            return True
+        return False
+    
+    async def _handle_barge_in(self, websocket: WebSocket) -> None:
+        """Handle barge-in interruption"""
+        print("🛑 Stopping agent response due to barge-in")
+        
+        # Cancel current response task if running
+        if self._current_response_task and not self._current_response_task.done():
+            self._current_response_task.cancel()
+            print("🛑 Cancelled ongoing response task")
+        
+        # Mark that we're no longer speaking
+        self._is_agent_speaking = False
+        self._barge_in_detected = True
+        
+        # Send immediate acknowledgment
+        await websocket.send_json({
+            "event": "mark",
+            "streamSid": self.stream_sid,
+            "mark": {
+                "name": "barge_in_ack",
+                "payload": {"text": "Sorry, go ahead..."}
+            }
+        })
+        
+        # Reset Deepgram buffer to start fresh listening
+        self.deepgram.audio_buffer.clear()
+        
+        self.recorder.log("ASR", "barge_in_handled")
+
     async def _handle_text(self, text: str, websocket: WebSocket, *, infer: bool = True) -> None:
         if not text:
             return
@@ -429,8 +486,23 @@ class RealtimeLoop:
         if not transcript.transcript:
             print("❌ Empty transcript, skipping")
             return
+        
+        # Reset barge-in state when processing new transcript
+        self._barge_in_detected = False
+        self._is_agent_speaking = False
             
         print(f"🤖 AGENT THINKING: '{transcript.transcript}'")
+        
+        # Send engagement prompt for longer processing
+        if len(transcript.transcript) > 20:  # Longer queries might take time
+            await websocket.send_json({
+                "event": "mark",
+                "streamSid": self.stream_sid,
+                "mark": {
+                    "name": "processing_prompt",
+                    "payload": {"text": "Let me check that for you right now..."}
+                }
+            })
         
         with self.recorder.stage("PLAN", transcript=transcript.transcript):
             agent_response = await self.openai.infer(transcript)
@@ -439,6 +511,28 @@ class RealtimeLoop:
 
         if agent_response.tool_calls:
             print(f"🔧 Executing {len(agent_response.tool_calls)} tool calls")
+            
+            # Send engagement prompt during tool execution
+            tool_names = [call.name for call in agent_response.tool_calls]
+            if "check_availability" in tool_names:
+                await websocket.send_json({
+                    "event": "mark", 
+                    "streamSid": self.stream_sid,
+                    "mark": {
+                        "name": "tool_engagement",
+                        "payload": {"text": "Checking live availability for you right now..."}
+                    }
+                })
+            elif "book_tour" in tool_names:
+                await websocket.send_json({
+                    "event": "mark",
+                    "streamSid": self.stream_sid, 
+                    "mark": {
+                        "name": "booking_engagement",
+                        "payload": {"text": "Booking your tour now - stay on the line..."}
+                    }
+                })
+            
             tool_results = await self._execute_tool_calls(agent_response.tool_calls)
             if tool_results:
                 summary = self._render_tool_results(tool_results)
@@ -449,7 +543,8 @@ class RealtimeLoop:
                 print(f"🔧 Tool results: '{summary}'")
 
         # Synthesize audio suitable for Twilio (8kHz mu-law) and stream back
-        print(f"🗣️ Synthesizing audio for: '{agent_response.text}'")
+        print(f"🗣️ Synthesizing audio for: '{agent_response.text}' (barge_in: {agent_response.barge_in})")
+        
         if agent_response.tts_audio_b64:
             try:
                 audio_bytes = base64.b64decode(agent_response.tts_audio_b64)
@@ -461,9 +556,20 @@ class RealtimeLoop:
             print("⚠️ No audio generated, using tone")
             audio_bytes = _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
             
-        print(f"📡 Sending response to Twilio: {len(audio_bytes)} bytes")
-        await self._send_twilio_agent_events(agent_response.text, audio_bytes, websocket)
-        print(f"✅ Response sent successfully")
+        print(f"📡 Sending {'interruptible' if agent_response.barge_in else 'standard'} response: {len(audio_bytes)} bytes")
+        
+        # Create response task that can be cancelled
+        self._current_response_task = asyncio.create_task(
+            self._send_twilio_agent_events(agent_response.text, audio_bytes, websocket)
+        )
+        
+        try:
+            await self._current_response_task
+            print(f"✅ Response sent successfully")
+        except asyncio.CancelledError:
+            print(f"🚨 Response cancelled due to barge-in")
+        finally:
+            self._current_response_task = None
 
     async def _execute_tool_calls(self, tool_calls: List[ToolCallRequest]) -> List[ToolCallResult]:
         results: List[ToolCallResult] = []
@@ -491,7 +597,13 @@ class RealtimeLoop:
 
     async def _send_twilio_agent_events(self, text: str, audio_bytes: bytes, websocket: WebSocket) -> None:
         if self.stream_sid is None:
-            logger.warning("realtime.no_stream_sid")
+            print("⚠️ No stream ID available")
+            return
+            
+        # Mark that agent is starting to speak
+        self._is_agent_speaking = True
+        self._barge_in_detected = False
+        
         mark_payload = {
             "event": "mark",
             "streamSid": self.stream_sid,
@@ -501,35 +613,68 @@ class RealtimeLoop:
             },
         }
         await websocket.send_json(mark_payload)
-        # Twilio expects 8kHz mu-law 20ms frames (160 bytes) base64-encoded per message
+        
+        # Send audio with barge-in capability
         if audio_bytes:
-            frame_size_bytes = 160
-            frames_sent = 0
-            for i in range(0, len(audio_bytes), frame_size_bytes):
-                frame = audio_bytes[i : i + frame_size_bytes]
-                if not frame:
-                    continue
-                payload_b64 = base64.b64encode(frame).decode()
-                await websocket.send_json(
-                    {
-                        "event": "media",
-                        "streamSid": self.stream_sid,
-                        "media": {"payload": payload_b64},
-                    }
-                )
-                # Pace frames at ~10ms per chunk for faster playback and prevent timeouts
-                await asyncio.sleep(0.01)
-                frames_sent += 1
-            logger.info("realtime.audio_frames_sent frames=%d bytes=%d", frames_sent, len(audio_bytes))
+            await self._send_interruptible_audio(audio_bytes, websocket)
         else:
-            logger.warning("realtime.audio_empty")
-        await websocket.send_json(
-            {
-                "event": "mark",
-                "streamSid": self.stream_sid,
-                "mark": {"name": "agent_response_complete"},
-            }
-        )
+            print("⚠️ No audio generated")
+        
+        # Only send completion if not interrupted
+        if not self._barge_in_detected:
+            await websocket.send_json(
+                {
+                    "event": "mark",
+                    "streamSid": self.stream_sid,
+                    "mark": {"name": "agent_response_complete"},
+                }
+            )
+            print("✅ Agent response completed")
+        else:
+            print("🚨 Agent response interrupted by barge-in")
+        
+        # Mark that agent finished speaking
+        self._is_agent_speaking = False
+
+    async def _send_interruptible_audio(self, audio_bytes: bytes, websocket: WebSocket) -> None:
+        """Send audio frames with barge-in detection"""
+        frame_size_bytes = 160
+        frames_sent = 0
+        total_frames = len(audio_bytes) // frame_size_bytes
+        
+        print(f"📡 Sending {total_frames} audio frames (interruptible)")
+        
+        for i in range(0, len(audio_bytes), frame_size_bytes):
+            # Check for barge-in before each frame
+            if self._barge_in_detected:
+                print(f"🛑 Audio sending stopped at frame {frames_sent}/{total_frames} due to barge-in")
+                break
+                
+            frame = audio_bytes[i : i + frame_size_bytes]
+            if not frame:
+                continue
+                
+            payload_b64 = base64.b64encode(frame).decode()
+            await websocket.send_json(
+                {
+                    "event": "media",
+                    "streamSid": self.stream_sid,
+                    "media": {"payload": payload_b64},
+                }
+            )
+            
+            # Shorter sleep for more responsive barge-in detection
+            await asyncio.sleep(0.005)  # 5ms instead of 10ms for faster interruption
+            frames_sent += 1
+            
+            # Progress indicator for long responses
+            if frames_sent % 50 == 0:  # Every ~250ms
+                print(f"📡 Sending audio... {frames_sent}/{total_frames}")
+        
+        if not self._barge_in_detected:
+            print(f"📡 Completed sending {frames_sent} audio frames ({len(audio_bytes)} bytes)")
+        
+        self.recorder.log("ASR", "audio_frames_sent", frames=frames_sent, total=total_frames, interrupted=self._barge_in_detected)
 
     def _render_tool_results(self, tool_results: List[ToolCallResult]) -> str:
         summaries: List[str] = []
