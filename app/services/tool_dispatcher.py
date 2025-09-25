@@ -33,7 +33,7 @@ class ToolDispatcher:
 
     def _wrap(self, func: Callable[[Dict[str, Any]], Any]) -> Callable[[Dict[str, Any]], Any]:
         def wrapped(args: Dict[str, Any]) -> Any:
-            logger.info("tool.call", tool=func.__name__)
+            logger.info("tool.call tool=%s", func.__name__)
             return func(args)
 
         return wrapped

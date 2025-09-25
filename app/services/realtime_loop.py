@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 import logging
+import re
 import httpx
 from deepgram import DeepgramClient as SDKDeepgramClient, LiveOptions, LiveTranscriptionEvents
 from elevenlabs.client import ElevenLabs
@@ -22,6 +23,7 @@ from app.logging.flight_recorder import FlightRecorder
 from app.models.realtime import AgentResponse, RealtimeTranscript, ToolCallRequest, ToolCallResult, TwilioMediaPayload
 from app.services.agent_planner import AgentPlanner
 from app.services.tool_dispatcher import ToolDispatcher
+from app.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +37,11 @@ class DeepgramClient:
         self._connection = None
         self._latest_transcript = None
         self._transcript_queue = []
+        self._transcript_buffer = ""  # Buffer for accumulating partial transcripts
+        self._last_transcript_time = None
+        self._keepalive_task: Optional[asyncio.Task] = None
         if self.api_key:
             self._client = SDKDeepgramClient(self.api_key)
-        self._min_flush_bytes = 800  # Smaller chunks for streaming
         self._no_asr_warned = False
 
     def _has_voice_activity(self, audio_data: bytes) -> bool:
@@ -75,32 +79,154 @@ class DeepgramClient:
         voice_indicators = sum([has_variation, has_energy, has_changes])
         return voice_indicators >= 2
 
+    def _is_complete_sentence(self, text: str) -> bool:
+        """Determine if the buffered text represents a complete sentence/thought"""
+        if not text.strip():
+            return False
+            
+        text = text.strip().lower()
+        
+        # Ignore meaningless fragments and incomplete phrases
+        meaningless_fragments = [
+            'okay', 'ok', 'yeah', 'yes', 'no', 'um', 'uh', 'hmm', 'well', 'so', 
+            'and', 'but', 'or', 'the', 'a', 'an', 'is', 'are', 'was', 'were',
+            'questions', 'question', 'can you', 'i want', 'i need', 'i would'
+        ]
+        
+        # If it's just a meaningless fragment, don't process
+        if text in meaningless_fragments:
+            return False
+        
+        # If it's too short (less than 3 words) and not a clear command, ignore
+        words = text.split()
+        if len(words) < 3:
+            # Allow some short but meaningful phrases
+            meaningful_short = [
+                'book it', 'yes please', 'no thanks', 'thank you', 'sounds good',
+                '21 west end', 'hudson 360', 'riverview lofts', '1 bedroom', '2 bedroom',
+                'studio apartment', 'tomorrow morning', 'next week'
+            ]
+            if not any(phrase in text for phrase in meaningful_short):
+                return False
+        
+        # Check for sentence endings
+        if text.endswith(('.', '!', '?')):
+            return True
+            
+        # Check for complete phrases/questions that indicate intent
+        complete_patterns = [
+            'can you book me',
+            'i want to tour',
+            'i\'m interested in',
+            'interested in touring',
+            'what time',
+            'when can i',
+            'how much',
+            'do you have',
+            'i have pets',
+            'my name is',
+            'my email is',
+            'my phone is',
+            'book me for',
+            'schedule me',
+            'next tuesday',
+            'next wednesday',
+            'next thursday',
+            'next friday',
+            'next monday',
+            'this weekend',
+            'tomorrow at'
+        ]
+        
+        for pattern in complete_patterns:
+            if pattern in text:
+                return True
+                
+        # Check for time-based completeness (day + time mentions)
+        has_day = any(day in text for day in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'tomorrow', 'today', 'weekend', 'weekday'])
+        has_time = any(time_word in text for time_word in ['am', 'pm', 'morning', 'afternoon', 'evening', 'noon', 'midnight', '11am', '2pm', 'at 11'])
+        
+        if has_day and has_time:
+            return True
+            
+        # Check for property mentions (including fuzzy matches)
+        property_patterns = [
+            '21 west end', '21 west', 'twenty one west', '21 best end', '21 vest end',
+            'hudson 360', 'hudson', 'riverview lofts', 'riverview', 'river view'
+        ]
+        if any(prop in text for prop in property_patterns):
+            return True
+            
+        # If buffer is getting long (>6 words), consider it complete to avoid hanging
+        if len(text.split()) > 6:
+            return True
+            
+        return False
+
+    def _flush_transcript_buffer_if_stale(self) -> None:
+        """Flush transcript buffer if it's been sitting for too long without completion"""
+        if (self._transcript_buffer.strip() and 
+            self._last_transcript_time and 
+            (datetime.now(timezone.utc) - self._last_transcript_time).total_seconds() > 2.0):
+            
+            # Force flush the stale buffer
+            complete_transcript = RealtimeTranscript(
+                transcript=self._transcript_buffer.strip(),
+                confidence=0.8,  # Lower confidence for forced flush
+                timestamp=datetime.now(timezone.utc),
+            )
+            self._transcript_queue.append(complete_transcript)
+            print(f"🎤 STT (timeout): '{self._transcript_buffer.strip()}'")
+            self._transcript_buffer = ""
+
     async def start_streaming(self) -> None:
-        """Initialize Deepgram streaming connection using correct syntax from docs"""
+        """Initialize Deepgram streaming connection following documentation exactly"""
         if not self._client:
             return
             
         try:
-            # Create streaming connection
+            # Create streaming connection exactly as per docs
             self._connection = self._client.listen.websocket.v("1")
             
-            # Define handlers with correct signatures (SDK passes 'self' as first arg)
+            # Event handlers using method call syntax (decorator syntax has issues)
             def handle_transcript(self_dg, result, **kwargs):
-                if result.channel.alternatives:
+                # Handle the exact response format from docs: {"type":"Results","channel":{"alternatives":[...]}}
+                if hasattr(result, 'channel') and result.channel and result.channel.alternatives:
                     transcript_text = result.channel.alternatives[0].transcript
                     confidence = result.channel.alternatives[0].confidence
-                    if transcript_text.strip():  # Only process non-empty transcripts
-                        transcript = RealtimeTranscript(
-                            transcript=transcript_text,
-                            confidence=confidence,
-                            timestamp=datetime.now(timezone.utc),
-                        )
-                        self._transcript_queue.append(transcript)
-                        print(f"🎤 TRANSCRIPT: '{transcript_text}' (confidence: {confidence:.2f})")
+                    is_final = getattr(result, 'is_final', False)
+                    speech_final = getattr(result, 'speech_final', False)
+                    
+                    if transcript_text.strip():
+                        current_time = datetime.now(timezone.utc)
+                        
+                        if is_final or speech_final:
+                            # This is a final transcript - replace buffer with clean text
+                            self._transcript_buffer = transcript_text.strip()
+                            self._last_transcript_time = current_time
+                            
+                            # Check if we have a complete sentence/thought
+                            if self._is_complete_sentence(self._transcript_buffer):
+                                # Process the complete buffered transcript
+                                complete_transcript = RealtimeTranscript(
+                                    transcript=self._transcript_buffer.strip(),
+                                    confidence=confidence,
+                                    timestamp=current_time,
+                                )
+                                self._transcript_queue.append(complete_transcript)
+                                print(f"🎤 STT: '{self._transcript_buffer.strip()}'")
+                                self._transcript_buffer = ""  # Reset buffer
+                        else:
+                            # This is an interim result - just update the buffer without processing
+                            self._transcript_buffer = transcript_text.strip()
+                            self._last_transcript_time = current_time
             
             def handle_error(self_dg, error, **kwargs):
-                print(f"❌ Deepgram streaming error: {error}")
-                self.recorder.log("ASR", "streaming_error", error=str(error))
+                error_str = str(error)
+                if "1011" in error_str:
+                    print(f"⚠️ Deepgram timeout (will reconnect)")
+                else:
+                    print(f"❌ Deepgram error: {error}")
                 # Mark connection as failed for auto-restart
                 self._is_connected = False
                 self._connection = None
@@ -109,34 +235,54 @@ class DeepgramClient:
             self._connection.on(LiveTranscriptionEvents.Transcript, handle_transcript)
             self._connection.on(LiveTranscriptionEvents.Error, handle_error)
             
-            # Start connection with streaming options (exact syntax from docs)
+            # Correct parameters based on documentation (strings vs integers)
             options = LiveOptions(
-                model=os.getenv("DEEPGRAM_MODEL", "nova-3"),
-                language="en-US",
+                model="nova-3",
+                language="en",
+                encoding="mulaw",
+                sample_rate="8000",  # String as per docs
+                channels="1",        # String as per docs  
+                interim_results=True,
                 smart_format=True,
                 punctuate=True,
-                encoding="mulaw",
-                sample_rate=8000,
-                channels=1,
-                interim_results=False,  # Only final results for stability
-                endpointing=1000,  # 1 second pause detection for phone calls
+                endpointing="10",    # String as per docs (10ms default)
+                utterance_end_ms="1000",  # String as per docs
             )
             
             self._connection.start(options)
-            print("🔗 Deepgram streaming connection started")
-            self.recorder.log("ASR", "streaming_started")
+            print("🔗 Deepgram streaming ready")
             self._is_connected = True
             
+            # Start keepalive task to prevent 1011 timeouts
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+            
         except Exception as e:
-            print(f"❌ Failed to start Deepgram streaming: {e}")
-            self.recorder.log("ASR", "streaming_start_error", error=str(e))
+            print(f"❌ Streaming connection failed: {e}")
+            self._is_connected = False
+            self._connection = None
+
+    async def _keepalive_loop(self) -> None:
+        """Send KeepAlive messages to prevent timeout as per Deepgram docs"""
+        try:
+            while self._is_connected and self._connection:
+                await asyncio.sleep(8)  # Send keepalive every 8 seconds (before 10s timeout)
+                if self._connection and self._is_connected:
+                    try:
+                        # Send KeepAlive message as per documentation
+                        keepalive_msg = {"type": "KeepAlive"}
+                        self._connection.send(json.dumps(keepalive_msg))
+                    except Exception as e:
+                        print(f"⚠️ Keepalive failed: {e}")
+                        break
+        except asyncio.CancelledError:
+            pass  # Task was cancelled, exit gracefully
 
     async def transcribe_chunk(self, audio_chunk: bytes) -> Optional[RealtimeTranscript]:
         """Robust streaming transcription with auto-reconnection"""
         if not self._client:
-            self.recorder.log("ASR", "no_deepgram_client_available")
-        if not self._no_asr_warned:
-            self._no_asr_warned = True
+            if not self._no_asr_warned:
+                self.recorder.log("ASR", "no_deepgram_client_available")
+                self._no_asr_warned = True
             return None
             
         # Ensure streaming connection is active
@@ -148,6 +294,9 @@ class DeepgramClient:
             try:
                 self._connection.send(audio_chunk)
                 self._last_audio_time = datetime.now()
+                
+                # Check for buffered transcript timeout (flush if no activity for 2 seconds)
+                self._flush_transcript_buffer_if_stale()
                 
                 # Check for any new transcripts
                 if self._transcript_queue:
@@ -183,29 +332,33 @@ class DeepgramClient:
                 
                 # Close connection to get final results
                 self._connection.finish()
-                print("🔗 Deepgram streaming connection closed")
-                self.recorder.log("ASR", "streaming_finished")
+                self._connection = None
+                self._is_connected = False
                 
                 # Return any remaining transcript
                 if self._transcript_queue:
                     return self._transcript_queue.pop(0)
                     
             except Exception as e:
-                print(f"❌ Error finalizing Deepgram: {e}")
-                self.recorder.log("ASR", "streaming_finalize_error", error=str(e))
+                print(f"❌ Deepgram finalize error: {e}")
         
         self.audio_buffer.clear()
         return None
 
     async def close(self) -> None:
-        """Close the streaming connection"""
+        """Close the streaming connection and cleanup"""
+        # Cancel keepalive task
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            
+        # Close connection
         if self._connection:
             try:
                 self._connection.finish()
                 self._connection = None
-                print("🔗 Deepgram streaming connection closed")
+                self._is_connected = False
             except Exception as e:
-                print(f"⚠️ Error closing Deepgram connection: {e}")
+                print(f"⚠️ Deepgram close error: {e}")
 
 class OpenAIResponsesClient:
     def __init__(self, planner: AgentPlanner, dispatcher: ToolDispatcher, recorder: FlightRecorder) -> None:
@@ -216,10 +369,11 @@ class OpenAIResponsesClient:
         self.model = os.getenv("OPENAI_RESPONSES_MODEL", os.getenv("OPENAI_MODEL", "gpt-5"))
         self.system_prompt = os.getenv(
             "OPENAI_SYSTEM_PROMPT",
-            "You are a persuasive leasing specialist whose primary goal is to book apartment tours. "
-            "Keep callers engaged, create urgency around availability, and guide every conversation toward booking a tour. "
-            "Use phrases like 'I can book you right now', 'these units move fast', 'let me lock in a time for you'. "
-            "Never let calls end without a booking attempt. Be friendly but persistent about scheduling tours.",
+            "You are a helpful leasing specialist whose primary goal is to book apartment tours by gathering required information. "
+            "Ask specific, bite-sized questions to collect: Property, Bedroom size, Tour time, Contact info. "
+            "Be conversational and helpful, but always ask the next question needed to complete the booking. "
+            "Keep asking questions until you have all the information needed to schedule their tour. And then use the tour booking tools."
+            "Focus on being informative and systematically gathering the information needed to schedule their tour.",
         )
         self._http: Optional[httpx.AsyncClient] = None
         if self.api_key:
@@ -229,7 +383,7 @@ class OpenAIResponsesClient:
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=httpx.Timeout(20.0, connect=5.0),
+                timeout=httpx.Timeout(30.0, connect=10.0),
             )
 
     async def infer(self, transcript: RealtimeTranscript) -> AgentResponse:
@@ -241,9 +395,29 @@ class OpenAIResponsesClient:
             enable_barge_in = len(response_text) > 100  # Enable for responses longer than 100 chars
             return AgentResponse(text=response_text, barge_in=enable_barge_in)
 
+        # Inject current planner state and booking requirements for better tool selection
+        state_summary = self._summarize_state()
+        booking_context = self.planner._get_booking_requirements_context()
+        missing_info = self.planner._missing_booking_info()
+        
+        booking_rules = (
+            "CRITICAL: Until tour is booked, EVERY response must end with a question to gather the next missing piece of info. "
+            "Required to book: 1) Property name, 2) Bedroom size, 3) Tour date/time, 4) Contact info. "
+            "NEVER use sales phrases like 'units move fast', 'book you right now', 'these slots move fast'. "
+            "Instead ask specific questions like: 'What size apartment—studio, 1BR, or 2BR?' or 'What day works for your tour?' "
+            f"Currently missing: {', '.join(missing_info) if missing_info else 'NOTHING - READY TO BOOK'}. "
+            "Ask for the FIRST missing item only. Be helpful and conversational, not pushy."
+        )
+        
+        brevity_rules = (
+            "Be concise. Ask exactly one focused question at a time. "
+            "Prefer short sentences. Avoid multi-part lists unless strictly necessary. "
+            "Acknowledge new info briefly before asking the next question."
+        )
+        
         payload = {
             "model": self.model,
-            "instructions": self.system_prompt,
+            "instructions": f"{self.system_prompt}\n\n{booking_rules}\n\nRules: {brevity_rules}\n\nBooking Status: {booking_context}\n\nConversation State: {state_summary}",
             "input": [
                 {
                     "role": "user",
@@ -296,6 +470,29 @@ class OpenAIResponsesClient:
         # Enable barge-in for longer responses or when tools are involved
         enable_barge_in = len(text) > 100 or len(tool_calls) > 0
         return AgentResponse(text=text, barge_in=enable_barge_in, tool_calls=tool_calls)
+
+    def _summarize_state(self) -> str:
+        s = self.planner.state
+        parts = []
+        if s.property_name:
+            parts.append(f"property={s.property_name}")
+        if s.desired_bedrooms is not None:
+            parts.append(f"bedrooms={s.desired_bedrooms}")
+        if s.has_pets is not None:
+            parts.append(f"pets={'yes' if s.has_pets else 'no'}")
+        if s.tour_type:
+            parts.append(f"tour_type={s.tour_type}")
+        if s.move_in_date:
+            parts.append(f"move_in={s.move_in_date}")
+        if s.budget_min or s.budget_max:
+            parts.append(f"budget=${s.budget_min or ''}-{s.budget_max or ''}")
+        if s.requested_time:
+            parts.append(f"time={s.requested_time}")
+        if s.prospect_name:
+            parts.append("have_name")
+        if s.prospect_email or s.prospect_phone:
+            parts.append("have_contact")
+        return ", ".join(parts) or "(none)"
 
 
 class ElevenLabsClient:
@@ -357,7 +554,8 @@ class RealtimeLoop:
     def __init__(self, recorder: FlightRecorder) -> None:
         self.recorder = recorder
         self.dispatcher = ToolDispatcher(recorder)
-        self.planner = AgentPlanner(self.dispatcher, recorder)
+        self.memory_service = MemoryService(recorder)
+        self.planner = AgentPlanner(self.dispatcher, recorder, self.memory_service)
         self.deepgram = DeepgramClient(recorder)
         self.openai = OpenAIResponsesClient(self.planner, self.dispatcher, recorder)
         self.elevenlabs = ElevenLabsClient(recorder)
@@ -366,6 +564,7 @@ class RealtimeLoop:
         self._is_agent_speaking = False
         self._barge_in_detected = False
         self._current_response_task: Optional[asyncio.Task] = None
+        self._processing_transcript = False  # Lock to prevent concurrent transcript processing
 
     async def handle_event(self, payload: TwilioMediaPayload, websocket: WebSocket) -> None:
         if payload.event == "start":
@@ -373,6 +572,14 @@ class RealtimeLoop:
             self.call_sid = start_payload.get("callSid") or start_payload.get("streamSid")
             self.stream_sid = start_payload.get("streamSid") or payload.streamSid
             logger.info("realtime.call_started call_sid=%s stream_sid=%s", self.call_sid, self.stream_sid)
+            
+            # Set session context for memory - use call_sid as user_id and stream_sid as session_id
+            if self.call_sid and self.stream_sid:
+                self.planner.set_session_context(
+                    user_id=self.call_sid,  # Use call_sid as user identifier
+                    session_id=self.stream_sid  # Use stream_sid as session identifier
+                )
+            
             # Proactive greeting so caller hears something immediately
             await self._handle_text(
                 "Hi! Which building are you interested in touring from our portfolio?",
@@ -384,25 +591,25 @@ class RealtimeLoop:
             audio_b64 = payload.media.get("payload")
             if audio_b64:
                 audio_bytes = base64.b64decode(audio_b64)
-                self.recorder.log("ASR", "media_received", audio_bytes=len(audio_bytes), b64_length=len(audio_b64))
+                # Removed excessive media logging
+                
+                # Always process audio for transcription first
+                transcript = await self.deepgram.transcribe_chunk(audio_bytes)
                 
                 # Check for barge-in during agent responses
                 if self._is_agent_speaking:
                     if await self._detect_barge_in(audio_bytes):
                         await self._handle_barge_in(websocket)
+                        # Still process the transcript that caused the barge-in
+                        if transcript and transcript.transcript.strip():
+                            await self._handle_transcript(transcript, websocket)
                         return
                 
-                # Normal transcript processing
-                transcript = await self.deepgram.transcribe_chunk(audio_bytes)
-                if transcript:
-                    print(f"🎯 Processing transcript: '{transcript.transcript}'")
-                    self.recorder.log("ASR", "transcript_ready", text=transcript.transcript[:100])
+                # Normal transcript processing when agent is not speaking
+                if transcript and transcript.transcript.strip():
                     await self._handle_transcript(transcript, websocket)
-                    print(f"✅ Transcript processed successfully")
-                else:
-                    self.recorder.log("ASR", "no_transcript_yet", buffer_size=0)
             else:
-                self.recorder.log("ASR", "media_no_payload", media_keys=list(payload.media.keys()) if payload.media else [])
+                pass  # No audio payload - normal
             return
         if payload.event == "mark" and payload.mark:
             mark_name = payload.mark.get("name")
@@ -432,23 +639,27 @@ class RealtimeLoop:
 
     async def _detect_barge_in(self, audio_bytes: bytes) -> bool:
         """Detect if human is speaking during agent response (barge-in)"""
-        # Use the same VAD logic as DeepgramClient
-        has_voice = self.deepgram._has_voice_activity(audio_bytes)
+        # More sensitive barge-in detection
+        unique_values = len(set(audio_bytes))
+        non_silence_count = sum(1 for b in audio_bytes if b not in [0x00, 0x7F, 0xFF])
         
-        if has_voice:
+        # Lower threshold for barge-in detection (more sensitive)
+        variation_threshold = len(audio_bytes) * 0.02  # Just 2% variation needed
+        energy_threshold = 2  # Just 2 unique values needed
+        
+        has_variation = non_silence_count > variation_threshold
+        has_energy = unique_values > energy_threshold
+        
+        if has_variation or has_energy:  # Either condition triggers barge-in
             print("🚨 BARGE-IN detected!")
-            self.recorder.log("ASR", "barge_in_detected", audio_bytes=len(audio_bytes))
             return True
         return False
     
     async def _handle_barge_in(self, websocket: WebSocket) -> None:
         """Handle barge-in interruption"""
-        print("🛑 Stopping agent response due to barge-in")
-        
         # Cancel current response task if running
         if self._current_response_task and not self._current_response_task.done():
             self._current_response_task.cancel()
-            print("🛑 Cancelled ongoing response task")
         
         # Mark that we're no longer speaking
         self._is_agent_speaking = False
@@ -464,10 +675,9 @@ class RealtimeLoop:
             }
         })
         
-        # Reset Deepgram buffer to start fresh listening
-        self.deepgram.audio_buffer.clear()
-        
-        self.recorder.log("ASR", "barge_in_handled")
+        # Reset Deepgram buffer to start fresh listening  
+        if hasattr(self.deepgram, 'audio_buffer'):
+            self.deepgram.audio_buffer.clear()
 
     async def _handle_text(self, text: str, websocket: WebSocket, *, infer: bool = True) -> None:
         if not text:
@@ -484,33 +694,79 @@ class RealtimeLoop:
 
     async def _handle_transcript(self, transcript: RealtimeTranscript, websocket: WebSocket) -> None:
         if not transcript.transcript:
-            print("❌ Empty transcript, skipping")
+            # Skip empty transcripts silently
             return
-        
-        # Reset barge-in state when processing new transcript
-        self._barge_in_detected = False
-        self._is_agent_speaking = False
             
-        print(f"🤖 AGENT THINKING: '{transcript.transcript}'")
-        
-        # Send engagement prompt for longer processing
-        if len(transcript.transcript) > 20:  # Longer queries might take time
-            await websocket.send_json({
-                "event": "mark",
-                "streamSid": self.stream_sid,
-                "mark": {
-                    "name": "processing_prompt",
-                    "payload": {"text": "Let me check that for you right now..."}
-                }
-            })
-        
-        with self.recorder.stage("PLAN", transcript=transcript.transcript):
-            agent_response = await self.openai.infer(transcript)
+        # Prevent concurrent transcript processing
+        if self._processing_transcript:
+            print(f"⏳ Skipping transcript (already processing): '{transcript.transcript}'")
+            return
             
-        print(f"💭 AGENT RESPONSE: '{agent_response.text}'")
+        self._processing_transcript = True
+        try:
+            # Reset barge-in state when processing new transcript
+            self._barge_in_detected = False
+            self._is_agent_speaking = False
+                
+            print(f"🧠 THINKING: '{transcript.transcript}'")
+            
+            # Send engagement prompt for longer processing
+            if len(transcript.transcript) > 20:  # Longer queries might take time
+                await websocket.send_json({
+                    "event": "mark",
+                    "streamSid": self.stream_sid,
+                    "mark": {
+                        "name": "processing_prompt",
+                        "payload": {"text": "Let me check that for you right now..."}
+                    }
+                })
+            
+            with self.recorder.stage("PLAN", transcript=transcript.transcript):
+                # CRITICAL: Update planner state BEFORE generating response
+                # This ensures OpenAI has the latest state when making decisions
+                print(f"🔄 UPDATING STATE with: '{transcript.transcript}'")
+                planner_response = await self.planner.process_transcript(transcript.transcript)
+                print(f"🏢 STATE AFTER UPDATE - Property: {self.planner.state.property_name}, Bedrooms: {self.planner.state.desired_bedrooms}, Phone: {self.planner.state.prospect_phone}, Email: {self.planner.state.prospect_email}, Name: {self.planner.state.prospect_name}")
+                
+                # Now get OpenAI response with updated state
+                agent_response = await self.openai.infer(transcript)
+                
+                # If OpenAI didn't generate a good response, use planner's response
+                if not agent_response.text or not agent_response.text.strip():
+                    agent_response.text = planner_response.get("text", "")
+                
+            # Ensure we have a meaningful response based on current state
+            if not agent_response.text or not agent_response.text.strip():
+                # Use planner state to generate context-aware fallback
+                missing = self.planner._missing_booking_info()
+                if missing:
+                    agent_response.text = self.planner._get_next_question(missing[0])
+                else:
+                    agent_response.text = "Perfect! Ready to book your tour?"
+            
+            # Ensure every response contains a question until tour is booked
+            missing = self.planner._missing_booking_info()
+            if missing and agent_response.text and not agent_response.text.endswith("?"):
+                next_question = self.planner._get_next_question(missing[0])
+                if next_question not in agent_response.text:
+                    agent_response.text = agent_response.text.rstrip(".") + f". {next_question}"
+            
+            # Enforce concise runtime style: trim to ~2 sentences or 180 chars
+            def _condense(text: str) -> str:
+                if not text:
+                    return text
+                # Split on sentence enders
+                parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+                short = " ".join(parts[:2])
+                if len(short) > 180:
+                    short = short[:177].rstrip() + "..."
+                return short
 
-        if agent_response.tool_calls:
-            print(f"🔧 Executing {len(agent_response.tool_calls)} tool calls")
+            agent_response.text = _condense(agent_response.text)
+            print(f"💬 RESPONSE: '{agent_response.text}'")
+
+            if agent_response.tool_calls:
+                print(f"🔧 TOOLS: {', '.join(call.name for call in agent_response.tool_calls)}")
             
             # Send engagement prompt during tool execution
             tool_names = [call.name for call in agent_response.tool_calls]
@@ -540,36 +796,38 @@ class RealtimeLoop:
                     agent_response.text = f"{agent_response.text} {summary}".strip()
                 else:
                     agent_response.text = summary
-                print(f"🔧 Tool results: '{summary}'")
+                # Removed verbose tool results logging
 
-        # Synthesize audio suitable for Twilio (8kHz mu-law) and stream back
-        print(f"🗣️ Synthesizing audio for: '{agent_response.text}' (barge_in: {agent_response.barge_in})")
-        
-        if agent_response.tts_audio_b64:
-            try:
-                audio_bytes = base64.b64decode(agent_response.tts_audio_b64)
-            except Exception:  # noqa: BLE001
-                audio_bytes = b""
-        else:
-            audio_bytes = await self.elevenlabs.synthesize(agent_response.text or "")
-        if not audio_bytes:
-            print("⚠️ No audio generated, using tone")
-            audio_bytes = _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
+            # Synthesize audio suitable for Twilio (8kHz mu-law) and stream back
+            print(f"🗣️ TTS: Generating audio ({'interruptible' if agent_response.barge_in else 'standard'})")
             
-        print(f"📡 Sending {'interruptible' if agent_response.barge_in else 'standard'} response: {len(audio_bytes)} bytes")
-        
-        # Create response task that can be cancelled
-        self._current_response_task = asyncio.create_task(
-            self._send_twilio_agent_events(agent_response.text, audio_bytes, websocket)
-        )
-        
-        try:
-            await self._current_response_task
-            print(f"✅ Response sent successfully")
-        except asyncio.CancelledError:
-            print(f"🚨 Response cancelled due to barge-in")
+            if agent_response.tts_audio_b64:
+                try:
+                    audio_bytes = base64.b64decode(agent_response.tts_audio_b64)
+                except Exception:  # noqa: BLE001
+                    audio_bytes = b""
+            else:
+                audio_bytes = await self.elevenlabs.synthesize(agent_response.text or "")
+            if not audio_bytes:
+                audio_bytes = _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
+                
+            # Removed verbose sending log
+            
+            # Create response task that can be cancelled
+            self._current_response_task = asyncio.create_task(
+                self._send_twilio_agent_events(agent_response.text, audio_bytes, websocket)
+            )
+            
+            try:
+                await self._current_response_task
+                print(f"✅ SENT")
+            except asyncio.CancelledError:
+                print(f"🚨 INTERRUPTED")
+            finally:
+                self._current_response_task = None
         finally:
-            self._current_response_task = None
+            # Always release the transcript processing lock
+            self._processing_transcript = False
 
     async def _execute_tool_calls(self, tool_calls: List[ToolCallRequest]) -> List[ToolCallResult]:
         results: List[ToolCallResult] = []
@@ -585,7 +843,15 @@ class RealtimeLoop:
             try:
                 stage_name = stage_map.get(call.name, "PLAN")
                 with self.recorder.stage(stage_name, tool=call.name):
-                    output = self.dispatcher.dispatch(call.name, call.arguments)
+                    # Gate booking until required info is captured
+                    if call.name == "book_tour":
+                        missing = self.planner._missing_booking_info()
+                        if missing:
+                            output = {"missing_booking_info": missing}
+                        else:
+                            output = self.dispatcher.dispatch(call.name, call.arguments)
+                    else:
+                        output = self.dispatcher.dispatch(call.name, call.arguments)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("tool.error name=%s err=%s", call.name, exc)
                 output = {"error": str(exc)}
@@ -629,9 +895,9 @@ class RealtimeLoop:
                     "mark": {"name": "agent_response_complete"},
                 }
             )
-            print("✅ Agent response completed")
+            pass  # Completed normally
         else:
-            print("🚨 Agent response interrupted by barge-in")
+            pass  # Interrupted by barge-in
         
         # Mark that agent finished speaking
         self._is_agent_speaking = False
@@ -642,18 +908,17 @@ class RealtimeLoop:
         frames_sent = 0
         total_frames = len(audio_bytes) // frame_size_bytes
         
-        print(f"📡 Sending {total_frames} audio frames (interruptible)")
-        
+        # Send audio frames with barge-in detection (minimal logging)
         for i in range(0, len(audio_bytes), frame_size_bytes):
             # Check for barge-in before each frame
             if self._barge_in_detected:
-                print(f"🛑 Audio sending stopped at frame {frames_sent}/{total_frames} due to barge-in")
+                print(f"🛑 INTERRUPTED at {frames_sent}/{total_frames}")
                 break
                 
             frame = audio_bytes[i : i + frame_size_bytes]
             if not frame:
                 continue
-                
+            
             payload_b64 = base64.b64encode(frame).decode()
             await websocket.send_json(
                 {
@@ -662,23 +927,24 @@ class RealtimeLoop:
                     "media": {"payload": payload_b64},
                 }
             )
+            frames_sent += 1
             
             # Shorter sleep for more responsive barge-in detection
             await asyncio.sleep(0.005)  # 5ms instead of 10ms for faster interruption
-            frames_sent += 1
-            
-            # Progress indicator for long responses
-            if frames_sent % 50 == 0:  # Every ~250ms
-                print(f"📡 Sending audio... {frames_sent}/{total_frames}")
         
-        if not self._barge_in_detected:
-            print(f"📡 Completed sending {frames_sent} audio frames ({len(audio_bytes)} bytes)")
-        
-        self.recorder.log("ASR", "audio_frames_sent", frames=frames_sent, total=total_frames, interrupted=self._barge_in_detected)
+        # Minimal completion logging
+        if self._barge_in_detected:
+            print(f"🛑 Audio interrupted after {frames_sent} frames")
 
     def _render_tool_results(self, tool_results: List[ToolCallResult]) -> str:
         summaries: List[str] = []
         for result in tool_results:
+            if isinstance(result.output, dict) and result.output.get("missing_booking_info"):
+                missing = result.output.get("missing_booking_info")
+                # Ask for missing info in a natural way
+                prompt = self.planner._prompt_for_missing(missing)
+                summaries.append(prompt)
+                continue
             if result.name == "book_tour" and "booking_id" in result.output:
                 summaries.append(
                     "Booking confirmed. Confirmation ID "

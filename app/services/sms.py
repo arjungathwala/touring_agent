@@ -32,7 +32,7 @@ class SmsClient:
                 response = await client.post(url, data=payload)
             response.raise_for_status()
             data = response.json()
-            logger.info("sms.sent", to=_redact(to_phone), sid=data.get("sid"))
+            logger.info("sms.sent to=%s sid=%s", _redact(to_phone), data.get("sid"))
             return {
                 "status": data.get("status", "queued"),
                 "to": data.get("to", to_phone),
