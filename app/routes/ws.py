@@ -17,11 +17,7 @@ async def twilio_media_stream(websocket: WebSocket) -> None:
     recorder = FlightRecorder()
     realtime_loop = RealtimeLoop(recorder)
     
-    # Log memory service availability
-    if realtime_loop.memory_service.is_available():
-        recorder.log("WS", "connection_accepted_with_memory", remote_addr=str(websocket.client))
-    else:
-        recorder.log("WS", "connection_accepted_no_memory", remote_addr=str(websocket.client))
+    # Session-based state management (no persistent memory)
     
     recorder.log("WS", "connection_accepted", remote_addr=str(websocket.client))
     try:

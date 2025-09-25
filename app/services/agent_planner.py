@@ -12,7 +12,6 @@ from dateutil import tz
 from app.logging.flight_recorder import FlightRecorder
 from app.models.tooling import AvailabilityQuery, NetEffectiveRentRequest, SisterPropertyRouteRequest, TourRequest
 from app.services.tool_dispatcher import ToolDispatcher
-from app.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +46,10 @@ class PlannerState:
 
 
 class AgentPlanner:
-    def __init__(self, dispatcher: ToolDispatcher, recorder: FlightRecorder, memory_service: Optional[MemoryService] = None) -> None:
+    def __init__(self, dispatcher: ToolDispatcher, recorder: FlightRecorder) -> None:
         self.dispatcher = dispatcher
         self.recorder = recorder
-        self.memory_service = memory_service
         self.state = PlannerState()
-        self.user_id: Optional[str] = None
-        self.session_id: Optional[str] = None
 
     async def process_transcript(self, transcript: str) -> Dict[str, str]:
         logger.info("planner.transcript %s", transcript)
@@ -63,9 +59,7 @@ class AgentPlanner:
         self.state.conversation_turns += 1
         self.state.last_engagement_time = datetime.now()
         
-        # Load user context on first turn if memory service is available
-        if self.state.conversation_turns == 1 and self.memory_service and self.user_id:
-            await self.load_user_context()
+        # Memory service removed - using session-only state management
         
         # ALWAYS capture information from current transcript
         logger.info("BEFORE capture - Property: %s, Bedrooms: %s", self.state.property_name, self.state.desired_bedrooms)
@@ -100,14 +94,9 @@ class AgentPlanner:
         response["missing_info"] = missing
         response["next_action"] = next_action
         
-        # Save conversation to memory (disabled temporarily due to API format issues)
-        if False:  # Temporarily disabled - self.memory_service and self.user_id and self.session_id:
-            logger.info("SAVING MEMORY - User: %s, Session: %s, Property: %s, Bedrooms: %s", 
-                       self.user_id, self.session_id, self.state.property_name, self.state.desired_bedrooms)
-            await self.save_conversation_memory(transcript, response["text"])
-            await self.save_state_memory()
-        else:
-            logger.info("MEMORY DISABLED - Session state maintained in memory only")
+        # Session state maintained without persistent memory
+        logger.info("SESSION STATE - Property: %s, Bedrooms: %s, Phone: %s", 
+                   self.state.property_name, self.state.desired_bedrooms, self.state.prospect_phone)
         
         # Log current state and context for debugging
         logger.info("Booking Context: %s", booking_context)
@@ -766,127 +755,7 @@ class AgentPlanner:
             phone=self.state.prospect_phone,
         )
 
-    def set_session_context(self, user_id: str, session_id: str) -> None:
-        """Set the user and session context for memory operations."""
-        self.user_id = user_id
-        self.session_id = session_id
-
-    async def load_user_context(self) -> None:
-        """Load user context from memory to inform responses."""
-        if not self.memory_service or not self.user_id:
-            return
-            
-        try:
-            # Get user summary
-            summary = await self.memory_service.get_user_summary(self.user_id)
-            if summary and "No previous interaction" not in summary:
-                logger.info("Loaded user context: %s", summary[:100])
-                self.recorder.log("PLAN", "context_loaded", user_id=self.user_id, summary=summary[:100])
-                
-            # Load ALL user context to pre-populate state
-            memories = await self.memory_service.retrieve_user_context(self.user_id)
-            
-            # Apply memories to current state if they're recent and relevant
-            for memory in memories[-10:]:  # Last 10 memories for more context
-                if isinstance(memory, dict):
-                    # Handle different memory formats from mem0
-                    text = memory.get("text") or memory.get("memory") or str(memory)
-                    text_lower = text.lower()
-                    
-                    # Extract property preference with better matching
-                    if any(prop in text_lower for prop in ["21 west end", "21 west", "twenty one west"]) and not self.state.property_id:
-                        self.state.property_id = "21we"
-                        self.state.property_name = "21 West End"
-                        logger.info("Memory: Loaded property preference - 21 West End")
-                    elif any(prop in text_lower for prop in ["hudson 360", "hudson"]) and not self.state.property_id:
-                        self.state.property_id = "hudson-360"  
-                        self.state.property_name = "Hudson 360"
-                        logger.info("Memory: Loaded property preference - Hudson 360")
-                    elif any(prop in text_lower for prop in ["riverview lofts", "riverview"]) and not self.state.property_id:
-                        self.state.property_id = "riverview-lofts"
-                        self.state.property_name = "Riverview Lofts"
-                        logger.info("Memory: Loaded property preference - Riverview Lofts")
-                    
-                    # Extract bedroom preference
-                    if any(bed in text_lower for bed in ["studio", "0 bedroom"]) and self.state.desired_bedrooms is None:
-                        self.state.desired_bedrooms = 0
-                        logger.info("Memory: Loaded bedroom preference - studio")
-                    elif any(bed in text_lower for bed in ["1 bedroom", "one bedroom", "1br"]) and self.state.desired_bedrooms is None:
-                        self.state.desired_bedrooms = 1
-                        logger.info("Memory: Loaded bedroom preference - 1BR")
-                    elif any(bed in text_lower for bed in ["2 bedroom", "two bedroom", "2br"]) and self.state.desired_bedrooms is None:
-                        self.state.desired_bedrooms = 2
-                        logger.info("Memory: Loaded bedroom preference - 2BR")
-                        
-                    # Extract pet preference
-                    if any(pet in text_lower for pet in ["has pets", "have pets", "dog", "cat"]):
-                        self.state.has_pets = True
-                        logger.info("Memory: Loaded pet status - has pets")
-                        
-                    # Extract contact info
-                    if "name is" in text_lower and not self.state.prospect_name:
-                        import re
-                        name_match = re.search(r"name is ([a-zA-Z\s]+)", text_lower)
-                        if name_match:
-                            self.state.prospect_name = name_match.group(1).strip().title()
-                            logger.info("Memory: Loaded name - %s", self.state.prospect_name)
-                    
-                    if "@" in text and not self.state.prospect_email:
-                        import re
-                        email_match = re.search(r"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", text)
-                        if email_match:
-                            self.state.prospect_email = email_match.group(1)
-                            logger.info("Memory: Loaded email - %s", self.state.prospect_email)
-            
-            # Log what we loaded from memory
-            if self.state.property_id or self.state.desired_bedrooms is not None or self.state.has_pets or self.state.prospect_name:
-                logger.info("Memory context loaded: property=%s, bedrooms=%s, pets=%s, name=%s", 
-                           self.state.property_name, self.state.desired_bedrooms, self.state.has_pets, self.state.prospect_name)
-                            
-        except Exception as e:
-            logger.error("Failed to load user context: %s", e)
-            self.recorder.log("PLAN", "context_load_error", error=str(e))
-
-    async def save_conversation_memory(self, transcript: str, response: str) -> None:
-        """Save conversation exchange to memory."""
-        if not self.memory_service or not self.user_id or not self.session_id:
-            return
-            
-        try:
-            messages = [
-                {"role": "user", "content": transcript},
-                {"role": "assistant", "content": response}
-            ]
-            
-            await self.memory_service.store_conversation_memory(
-                messages=messages,
-                user_id=self.user_id,
-                session_id=self.session_id,
-                metadata={
-                    "property_id": self.state.property_id,
-                    "conversation_turn": self.state.conversation_turns
-                }
-            )
-            
-        except Exception as e:
-            logger.error("Failed to save conversation memory: %s", e)
-            self.recorder.log("PLAN", "memory_save_error", error=str(e))
-
-    async def save_state_memory(self) -> None:
-        """Save current planner state to memory."""
-        if not self.memory_service or not self.user_id or not self.session_id:
-            return
-            
-        try:
-            await self.memory_service.store_planner_state(
-                state=self.state,
-                user_id=self.user_id,
-                session_id=self.session_id
-            )
-            
-        except Exception as e:
-            logger.error("Failed to save state memory: %s", e)
-            self.recorder.log("PLAN", "state_memory_error", error=str(e))
+    # Memory service methods removed - using session-only state management
 
 
 def _upcoming_weekday_delta(target_weekday: int) -> timedelta:

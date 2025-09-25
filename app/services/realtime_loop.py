@@ -23,7 +23,6 @@ from app.logging.flight_recorder import FlightRecorder
 from app.models.realtime import AgentResponse, RealtimeTranscript, ToolCallRequest, ToolCallResult, TwilioMediaPayload
 from app.services.agent_planner import AgentPlanner
 from app.services.tool_dispatcher import ToolDispatcher
-from app.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -554,8 +553,7 @@ class RealtimeLoop:
     def __init__(self, recorder: FlightRecorder) -> None:
         self.recorder = recorder
         self.dispatcher = ToolDispatcher(recorder)
-        self.memory_service = MemoryService(recorder)
-        self.planner = AgentPlanner(self.dispatcher, recorder, self.memory_service)
+        self.planner = AgentPlanner(self.dispatcher, recorder)
         self.deepgram = DeepgramClient(recorder)
         self.openai = OpenAIResponsesClient(self.planner, self.dispatcher, recorder)
         self.elevenlabs = ElevenLabsClient(recorder)
@@ -573,12 +571,7 @@ class RealtimeLoop:
             self.stream_sid = start_payload.get("streamSid") or payload.streamSid
             logger.info("realtime.call_started call_sid=%s stream_sid=%s", self.call_sid, self.stream_sid)
             
-            # Set session context for memory - use call_sid as user_id and stream_sid as session_id
-            if self.call_sid and self.stream_sid:
-                self.planner.set_session_context(
-                    user_id=self.call_sid,  # Use call_sid as user identifier
-                    session_id=self.stream_sid  # Use stream_sid as session identifier
-                )
+            # Session started - planner state will be maintained for this session
             
             # Proactive greeting so caller hears something immediately
             await self._handle_text(

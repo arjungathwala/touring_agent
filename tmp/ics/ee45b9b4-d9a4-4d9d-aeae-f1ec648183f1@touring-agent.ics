@@ -1,0 +1,16 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Touring Agent//EN
+BEGIN:VEVENT
+UID:ee45b9b4-d9a4-4d9d-aeae-f1ec648183f1@touring-agent
+DTSTAMP:20250925T024343Z
+DTSTART;TZID=America/New_York:20250930T110000
+DTEND;TZID=America/New_York:20250930T114500
+SUMMARY:Tour for 21 West End
+DESCRIPTION:Prospect: Prospect
+Phone: +18053190650
+Email: prospect@example.com
+Notes: None
+LOCATION:1 W End Ave, New York, NY 10023
+END:VEVENT
+END:VCALENDAR
