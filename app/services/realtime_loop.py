@@ -9,15 +9,18 @@ import os
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, List, Optional
+from typing import Any, AsyncIterator, List, Optional
 
 import logging
 import re
-import httpx
+import threading
 from deepgram import DeepgramClient as SDKDeepgramClient, LiveOptions, LiveTranscriptionEvents
 from elevenlabs.client import ElevenLabs
-from elevenlabs import stream
+from elevenlabs import stream, VoiceSettings
 from fastapi import WebSocket
+from collections import deque
+
+from openai import AsyncOpenAI
 
 from app.logging.flight_recorder import FlightRecorder
 from app.models.realtime import AgentResponse, RealtimeTranscript, ToolCallRequest, ToolCallResult, TwilioMediaPayload
@@ -76,7 +79,14 @@ class DeepgramClient:
         
         # More lenient: any two of the three conditions
         voice_indicators = sum([has_variation, has_energy, has_changes])
-        return voice_indicators >= 2
+
+        speaking = voice_indicators >= 2
+        if speaking:
+            # Immediately interrupt any ongoing TTS playback
+            if self._current_tts_task and not self._current_tts_task.done():
+                self._current_tts_task.cancel()
+            self._barge_in_detected = True
+        return speaking
 
     def _is_complete_sentence(self, text: str) -> bool:
         """Determine if the buffered text represents a complete sentence/thought"""
@@ -359,35 +369,46 @@ class DeepgramClient:
             except Exception as e:
                 print(f"⚠️ Deepgram close error: {e}")
 
-class OpenAIResponsesClient:
+class GroqResponsesClient:
     def __init__(self, planner: AgentPlanner, dispatcher: ToolDispatcher, recorder: FlightRecorder) -> None:
         self.planner = planner
         self.dispatcher = dispatcher
         self.recorder = recorder
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = os.getenv("OPENAI_RESPONSES_MODEL", os.getenv("OPENAI_MODEL", "gpt-5"))
+        self.api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
+        self.model = (
+            os.getenv("GROQ_RESPONSES_MODEL")
+            or os.getenv("GROQ_MODEL")
+            or os.getenv("OPENAI_RESPONSES_MODEL")
+            or os.getenv("OPENAI_MODEL")
+            or "openai/gpt-oss-20b"
+        )
         self.system_prompt = os.getenv(
-            "OPENAI_SYSTEM_PROMPT",
+            "GROQ_SYSTEM_PROMPT",
             "You are a helpful leasing specialist whose primary goal is to book apartment tours by gathering required information. "
             "Ask specific, bite-sized questions to collect: Property, Bedroom size, Tour time, Contact info. "
             "Be conversational and helpful, but always ask the next question needed to complete the booking. "
             "Keep asking questions until you have all the information needed to schedule their tour. And then use the tour booking tools."
             "Focus on being informative and systematically gathering the information needed to schedule their tour.",
         )
-        self._http: Optional[httpx.AsyncClient] = None
+        if not self.system_prompt:
+            self.system_prompt = os.getenv(
+                "OPENAI_SYSTEM_PROMPT",
+                "You are a helpful leasing specialist whose primary goal is to book apartment tours by gathering required information. "
+                "Ask specific, bite-sized questions to collect: Property, Bedroom size, Tour time, Contact info. "
+                "Be conversational and helpful, but always ask the next question needed to complete the booking. "
+                "Keep asking questions until you have all the information needed to schedule their tour. And then use the tour booking tools."
+                "Focus on being informative and systematically gathering the information needed to schedule their tour.",
+            )
+        self._client: Optional[AsyncOpenAI] = None
         if self.api_key:
-            self._http = httpx.AsyncClient(
-                base_url="https://api.openai.com/v1",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                timeout=httpx.Timeout(30.0, connect=10.0),
+            self._client = AsyncOpenAI(
+                api_key=self.api_key,
+                base_url="https://api.groq.com/openai/v1",
             )
 
     async def infer(self, transcript: RealtimeTranscript) -> AgentResponse:
-        if not self._http:
-            self.recorder.log("PLAN", "openai_missing_api_key")
+        if not self._client:
+            self.recorder.log("PLAN", "groq_missing_api_key")
             text_response = await self.planner.process_transcript(transcript.transcript)
             # Enable barge-in for longer responses
             response_text = text_response.get("text", "")
@@ -398,7 +419,9 @@ class OpenAIResponsesClient:
         state_summary = self._summarize_state()
         booking_context = self.planner._get_booking_requirements_context()
         missing_info = self.planner._missing_booking_info()
-        
+        history = getattr(self.planner.state, "transcript_history", [])
+        history_text = " | ".join(f"{turn['role']}: {turn['text']}" for turn in history[-12:]) if history else "(none)"
+
         booking_rules = (
             "CRITICAL: Until tour is booked, EVERY response must end with a question to gather the next missing piece of info. "
             "Required to book: 1) Property name, 2) Bedroom size, 3) Tour date/time, 4) Contact info. "
@@ -407,7 +430,17 @@ class OpenAIResponsesClient:
             f"Currently missing: {', '.join(missing_info) if missing_info else 'NOTHING - READY TO BOOK'}. "
             "Ask for the FIRST missing item only. Be helpful and conversational, not pushy."
         )
-        
+
+        orchestration_rules = (
+            "You must write the entire response (no canned prompts). "
+            "Keep replies under 2 short sentences. "
+            "Do not try to book a tour until property, bedrooms, move-in date, budget, tour time, and contact are collected. "
+            "If no availability or property can't be found, recommend a sister property using the latest tool summary. "
+            "Whenever the caller supplies new information (property, bedrooms, move-in, budget, contact, tour time), call the matching planner_set_* tool with the structured value before replying. "
+            "Use planner_check_availability before offering to book and planner_recommend_sister when the primary property has no matches. "
+            "When referencing tool results, summarize in natural language."
+        )
+
         brevity_rules = (
             "Be concise. Ask exactly one focused question at a time. "
             "Prefer short sentences. Avoid multi-part lists unless strictly necessary. "
@@ -416,38 +449,34 @@ class OpenAIResponsesClient:
         
         payload = {
             "model": self.model,
-            "instructions": f"{self.system_prompt}\n\n{booking_rules}\n\nRules: {brevity_rules}\n\nBooking Status: {booking_context}\n\nConversation State: {state_summary}",
+            "instructions": (
+                f"{self.system_prompt}\n\n"
+                f"{booking_rules}\n\n"
+                f"Operational Instructions: {orchestration_rules}\n\n"
+                f"Style Rules: {brevity_rules}\n\n"
+                f"Booking Status: {booking_context}\n\n"
+                f"Conversation Memory: {history_text}\n\n"
+                f"Conversation State: {state_summary}"
+            ),
             "input": [
                 {
                     "role": "user",
                     "content": [{"type": "input_text", "text": transcript.transcript}],
                 }
             ],
-            "tools": self.dispatcher.get_tool_schemas(),
+            "tools": self._collect_llm_tools(),
         }
 
         try:
-            with self.recorder.stage("PLAN", provider="openai"):
-                response = await self._http.post("/responses", json=payload)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            body = exc.response.text if exc.response is not None else ""
-            logger.warning(
-                "openai.responses_http_error status=%s body=%s",
-                exc.response.status_code if exc.response is not None else "?",
-                body[:500],
-                exc_info=True,
-            )
-            self.recorder.log("PLAN", "openai_responses_error", status=exc.response.status_code if exc.response else "?", body=body[:200])
-            text_response = await self.planner.process_transcript(transcript.transcript)
-            return AgentResponse(text=text_response.get("text", ""), barge_in=False)
-        except httpx.HTTPError as exc:
-            logger.warning("openai.responses_transport_error %s", exc, exc_info=True)
-            self.recorder.log("PLAN", "openai_responses_transport_error", error=str(exc))
+            with self.recorder.stage("PLAN", provider="groq"):
+                response = await self._client.responses.create(**payload)
+        except Exception as exc:
+            logger.warning("groq.responses_error %s", exc, exc_info=True)
+            self.recorder.log("PLAN", "groq_responses_error", error=str(exc))
             text_response = await self.planner.process_transcript(transcript.transcript)
             return AgentResponse(text=text_response.get("text", ""), barge_in=False)
 
-        data = response.json()
+        data = response.dict()
         text_chunks: List[str] = []
         tool_calls: List[ToolCallRequest] = []
         for item in data.get("output", []):
@@ -468,7 +497,36 @@ class OpenAIResponsesClient:
         text = " ".join(text_chunks).strip()
         # Enable barge-in for longer responses or when tools are involved
         enable_barge_in = len(text) > 100 or len(tool_calls) > 0
-        return AgentResponse(text=text, barge_in=enable_barge_in, tool_calls=tool_calls)
+
+        tool_results: List[ToolCallResult] = []
+        for call in tool_calls:
+            try:
+                output = self.planner.execute_llm_tool(call.name, call.arguments)
+                tool_results.append(
+                    ToolCallResult(call_id=call.call_id, name=call.name, output=output)
+                )
+                text_chunks.append(output.get("text", ""))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("planner.tool_execution_error %s", call.name)
+                tool_results.append(
+                    ToolCallResult(call_id=call.call_id, name=call.name, output={"error": str(exc)})
+                )
+
+        text = " ".join(chunk for chunk in text_chunks if chunk).strip()
+
+        # Ensure the planner captures the final agent response for memory
+        if text:
+            self.planner.state.transcript_history.append({"role": "agent", "text": text})
+
+        # Enforce follow-up question when required
+        missing = self.planner._missing_booking_info()
+        if missing and not text.endswith("?"):
+            next_question = self.planner._get_next_question(missing[0])
+            if next_question and next_question not in text:
+                text = (text + " " + next_question).strip()
+
+        enable_barge_in = len(text) > 100 or bool(tool_results)
+        return AgentResponse(text=text, barge_in=enable_barge_in, tool_calls=tool_calls, tools=tool_results)
 
     def _summarize_state(self) -> str:
         s = self.planner.state
@@ -491,7 +549,19 @@ class OpenAIResponsesClient:
             parts.append("have_name")
         if s.prospect_email or s.prospect_phone:
             parts.append("have_contact")
+        if s.last_tool_summary:
+            parts.append(f"tool={s.last_tool_summary}")
+        if s.last_error:
+            parts.append(f"error={s.last_error}")
+        if s.sister_recommendation:
+            name = s.sister_recommendation.get("name")
+            parts.append(f"sister_option={name}")
+        parts.append(f"last_action={s.last_action}")
         return ", ".join(parts) or "(none)"
+
+    def _collect_llm_tools(self) -> List[Dict[str, Any]]:
+        planner_tools = getattr(self.planner, "get_llm_tool_schemas", None)
+        return planner_tools() if callable(planner_tools) else []
 
 
 class ElevenLabsClient:
@@ -500,53 +570,98 @@ class ElevenLabsClient:
         self.api_key = os.getenv("ELEVENLABS_API_KEY")
         self.voice_id = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
         self._client: Optional[ElevenLabs] = None
+        self._stream_lock = threading.Lock()
+        self._stream_buffer: deque[bytes] = deque()
+        self._stream_event = threading.Event()
         if self.api_key:
             self._client = ElevenLabs(api_key=self.api_key)
 
     async def synthesize(self, text: str) -> bytes:
+        """Retained for compatibility: generate full audio buffer."""
         if not text:
             return b""
         if not self._client:
             self.recorder.log("PLAN", "tts_stubbed")
             return _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
-        
+
+        def _collect_audio() -> bytes:
+            chunks: List[bytes] = []
+            for part in self._client.text_to_speech.convert(
+                self.voice_id,
+                text=text,
+                model_id="eleven_turbo_v2_5",
+                output_format="ulaw_8000",
+                voice_settings=VoiceSettings(
+                    stability=0.5,
+                    similarity_boost=0.75,
+                ),
+            ):
+                if isinstance(part, (bytes, bytearray)):
+                    chunks.append(bytes(part))
+            return b"".join(chunks)
+
         try:
             with self.recorder.stage("PLAN", provider="elevenlabs"):
-                # Use the official SDK's generate method with streaming
-                audio_generator = self._client.generate(
-                    text=text,
-                    voice=self.voice_id,
-                    model="eleven_turbo_v2_5",  # Fast model for real-time use
-                    voice_settings={
-                        "stability": 0.5,
-                        "similarity_boost": 0.75,
-                    },
-                    output_format="ulaw_8000",  # Twilio-compatible format
-                    stream=True
-                )
-                
-                # Collect all audio chunks
-                audio_chunks = []
-                def _sync_collect():
-                    for chunk in audio_generator:
-                        if chunk:
-                            audio_chunks.append(chunk)
-                
-                # Run the synchronous generator in a thread
-                await asyncio.to_thread(_sync_collect)
-                audio_bytes = b"".join(audio_chunks)
-                
+                audio_bytes = await asyncio.to_thread(_collect_audio)
             self.recorder.log("PLAN", "tts_generated", provider="elevenlabs", bytes=len(audio_bytes))
             return audio_bytes
-            
         except Exception as exc:
             logger.warning("elevenlabs.tts_error %s", exc, exc_info=True)
             self.recorder.log("PLAN", "tts_error", provider="elevenlabs", error=str(exc))
             return b""
 
-    async def close(self) -> None:
-        # The official SDK client doesn't require explicit closing
-        self._client = None
+    def stream_tts(self, text: str) -> AsyncIterator[bytes]:
+        """Stream audio chunks for immediate playback."""
+        if not text or not self._client:
+            async def _empty():
+                if not text:
+                    yield b""
+                else:
+                    yield _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
+            return _empty()
+
+        async def _stream_generator() -> AsyncIterator[bytes]:
+            queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+            class _Sentinel:
+                pass
+            sentinel = _Sentinel()
+            loop = asyncio.get_running_loop()
+
+            def _producer() -> None:
+                try:
+                    with self.recorder.stage("PLAN", provider="elevenlabs", operation="stream"):
+                        for part in self._client.text_to_speech.convert_as_stream(
+                            self.voice_id,
+                            text=text,
+                            model_id="eleven_turbo_v2_5",
+                            output_format="ulaw_8000",
+                            voice_settings=VoiceSettings(
+                                stability=0.5,
+                                similarity_boost=0.75,
+                                style=0.0,
+                                use_speaker_boost=True,
+                                speed=1.0,
+                            ),
+                        ):
+                            if part:
+                                asyncio.run_coroutine_threadsafe(queue.put(bytes(part)), loop)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("elevenlabs.stream_error %s", exc, exc_info=True)
+                finally:
+                    asyncio.run_coroutine_threadsafe(queue.put(sentinel), loop)
+
+            threading.Thread(target=_producer, daemon=True).start()
+
+            while True:
+                chunk = await queue.get()
+                if isinstance(chunk, _Sentinel):
+                    break
+                if chunk:
+                    yield chunk
+            if queue.empty():
+                return
+
+        return _stream_generator()
 
 
 class RealtimeLoop:
@@ -555,7 +670,7 @@ class RealtimeLoop:
         self.dispatcher = ToolDispatcher(recorder)
         self.planner = AgentPlanner(self.dispatcher, recorder)
         self.deepgram = DeepgramClient(recorder)
-        self.openai = OpenAIResponsesClient(self.planner, self.dispatcher, recorder)
+        self.groq = GroqResponsesClient(self.planner, self.dispatcher, recorder)
         self.elevenlabs = ElevenLabsClient(recorder)
         self.call_sid: Optional[str] = None
         self.stream_sid: Optional[str] = None
@@ -680,7 +795,7 @@ class RealtimeLoop:
             audio_bytes = await self.elevenlabs.synthesize(text)
             if not audio_bytes:
                 audio_bytes = _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
-            await self._send_twilio_agent_events(text, audio_bytes, websocket)
+            await self._send_twilio_agent_events(text, audio_bytes, None, websocket)
             return
         transcript = await self.deepgram.push_text(text)
         await self._handle_transcript(transcript, websocket)
@@ -721,8 +836,8 @@ class RealtimeLoop:
                 planner_response = await self.planner.process_transcript(transcript.transcript)
                 print(f"🏢 STATE AFTER UPDATE - Property: {self.planner.state.property_name}, Bedrooms: {self.planner.state.desired_bedrooms}, Phone: {self.planner.state.prospect_phone}, Email: {self.planner.state.prospect_email}, Name: {self.planner.state.prospect_name}")
                 
-                # Now get OpenAI response with updated state
-                agent_response = await self.openai.infer(transcript)
+                # Now get Groq response with updated state
+                agent_response = await self.groq.infer(transcript)
                 
                 # If OpenAI didn't generate a good response, use planner's response
                 if not agent_response.text or not agent_response.text.strip():
@@ -782,6 +897,7 @@ class RealtimeLoop:
                     }
                 })
             
+            # Execute tool calls (run independent tools concurrently for latency reduction)
             tool_results = await self._execute_tool_calls(agent_response.tool_calls)
             if tool_results:
                 summary = self._render_tool_results(tool_results)
@@ -793,22 +909,23 @@ class RealtimeLoop:
 
             # Synthesize audio suitable for Twilio (8kHz mu-law) and stream back
             print(f"🗣️ TTS: Generating audio ({'interruptible' if agent_response.barge_in else 'standard'})")
-            
+
             if agent_response.tts_audio_b64:
                 try:
                     audio_bytes = base64.b64decode(agent_response.tts_audio_b64)
+                    audio_stream = None
                 except Exception:  # noqa: BLE001
                     audio_bytes = b""
+                    audio_stream = None
             else:
-                audio_bytes = await self.elevenlabs.synthesize(agent_response.text or "")
-            if not audio_bytes:
+                audio_bytes = b""
+                audio_stream = self.elevenlabs.stream_tts(agent_response.text or "")
+
+            if not audio_bytes and audio_stream is None:
                 audio_bytes = _generate_mulaw_tone(duration_s=0.5, freq_hz=440)
-                
-            # Removed verbose sending log
-            
-            # Create response task that can be cancelled
+
             self._current_response_task = asyncio.create_task(
-                self._send_twilio_agent_events(agent_response.text, audio_bytes, websocket)
+                self._send_twilio_agent_events(agent_response.text, audio_bytes, audio_stream, websocket)
             )
             
             try:
@@ -824,19 +941,21 @@ class RealtimeLoop:
 
     async def _execute_tool_calls(self, tool_calls: List[ToolCallRequest]) -> List[ToolCallResult]:
         results: List[ToolCallResult] = []
-        stage_map = {
-            "check_availability": "PLAN",
-            "route_to_sister_property": "PLAN",
-            "compute_net_effective_rent": "NER",
-            "check_policy": "POLICY",
-            "book_tour": "BOOK_TOUR",
-            "send_sms": "SMS",
-        }
-        for call in tool_calls:
+        if not tool_calls:
+            return results
+
+        async def execute_call(call: ToolCallRequest) -> ToolCallResult:
+            stage_map = {
+                "check_availability": "PLAN",
+                "route_to_sister_property": "PLAN",
+                "compute_net_effective_rent": "NER",
+                "check_policy": "POLICY",
+                "book_tour": "BOOK_TOUR",
+                "send_sms": "SMS",
+            }
             try:
                 stage_name = stage_map.get(call.name, "PLAN")
                 with self.recorder.stage(stage_name, tool=call.name):
-                    # Gate booking until required info is captured
                     if call.name == "book_tour":
                         missing = self.planner._missing_booking_info()
                         if missing:
@@ -850,11 +969,14 @@ class RealtimeLoop:
                 output = {"error": str(exc)}
             if not isinstance(output, dict):
                 output = {"result": output}
-            result = ToolCallResult(call_id=call.call_id, name=call.name, output=output)
-            results.append(result)
-        return results
+            return ToolCallResult(call_id=call.call_id, name=call.name, output=output)
 
-    async def _send_twilio_agent_events(self, text: str, audio_bytes: bytes, websocket: WebSocket) -> None:
+        # Run tool calls concurrently (they use IO-bound operations)
+        tasks = [execute_call(call) for call in tool_calls]
+        results = await asyncio.gather(*tasks)
+        return list(results)
+
+    async def _send_twilio_agent_events(self, text: str, audio_bytes: bytes, audio_stream: Optional[AsyncIterator[bytes]], websocket: WebSocket) -> None:
         if self.stream_sid is None:
             print("⚠️ No stream ID available")
             return
@@ -873,13 +995,14 @@ class RealtimeLoop:
         }
         await websocket.send_json(mark_payload)
         
-        # Send audio with barge-in capability
-        if audio_bytes:
-            await self._send_interruptible_audio(audio_bytes, websocket)
+        if audio_stream is not None:
+            await self._send_streaming_audio(audio_stream, websocket)
         else:
-            print("⚠️ No audio generated")
+            if audio_bytes:
+                await self._send_interruptible_audio(audio_bytes, websocket)
+            else:
+                print("⚠️ No audio generated")
         
-        # Only send completion if not interrupted
         if not self._barge_in_detected:
             await websocket.send_json(
                 {
@@ -888,12 +1011,36 @@ class RealtimeLoop:
                     "mark": {"name": "agent_response_complete"},
                 }
             )
-            pass  # Completed normally
-        else:
-            pass  # Interrupted by barge-in
         
-        # Mark that agent finished speaking
         self._is_agent_speaking = False
+
+    async def _send_streaming_audio(self, audio_stream: AsyncIterator[bytes], websocket: WebSocket) -> None:
+        frame_size_bytes = 160
+        frame_interval = 0.01  # 10 ms
+        async for chunk in audio_stream:
+            if self._barge_in_detected:
+                print("🛑 Streaming interrupted by barge-in")
+                break
+            start = 0
+            while start < len(chunk):
+                if self._barge_in_detected:
+                    print("🛑 Streaming interrupted mid-chunk")
+                    break
+                frame = chunk[start : start + frame_size_bytes]
+                start += frame_size_bytes
+                if not frame:
+                    continue
+                payload_b64 = base64.b64encode(frame).decode()
+                await websocket.send_json(
+                    {
+                        "event": "media",
+                        "streamSid": self.stream_sid,
+                        "media": {"payload": payload_b64},
+                    }
+                )
+                await asyncio.sleep(frame_interval)
+        if self._barge_in_detected:
+            print("🛑 Streaming audio interrupted")
 
     async def _send_interruptible_audio(self, audio_bytes: bytes, websocket: WebSocket) -> None:
         """Send audio frames with barge-in detection"""
@@ -928,6 +1075,13 @@ class RealtimeLoop:
         # Minimal completion logging
         if self._barge_in_detected:
             print(f"🛑 Audio interrupted after {frames_sent} frames")
+            # Notify stop to Twilio so TTS playback ceases immediately
+            await websocket.send_json(
+                {
+                    "event": "stop",
+                    "streamSid": self.stream_sid,
+                }
+            )
 
     def _render_tool_results(self, tool_results: List[ToolCallResult]) -> str:
         summaries: List[str] = []

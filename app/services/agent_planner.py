@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
+import json
 from typing import Any, Dict, List, Optional
 
 import logging
@@ -10,9 +12,23 @@ from dateutil import parser as dateparser
 from dateutil import tz
 
 from app.logging.flight_recorder import FlightRecorder
-from app.models.tooling import AvailabilityQuery, NetEffectiveRentRequest, SisterPropertyRouteRequest, TourRequest
-from app.services.tool_dispatcher import ToolDispatcher
+from openai import AsyncOpenAI
 
+from app.models.slot_updates import (
+    BedroomUpdate,
+    BudgetUpdate,
+    ContactUpdate,
+    EmptyPayload,
+    PlannerStateExtraction,
+    MoveInUpdate,
+    PropertyUpdate,
+    TourTimeUpdate,
+)
+from app.models.tooling import AvailabilityQuery, NetEffectiveRentRequest, SisterPropertyRouteRequest, TourRequest
+from app.services import portfolio
+from app.services.tool_dispatcher import ToolDispatcher
+from word2number import w2n
+import os
 logger = logging.getLogger(__name__)
 
 
@@ -20,6 +36,9 @@ logger = logging.getLogger(__name__)
 class PlannerState:
     property_id: Optional[str] = None
     property_name: Optional[str] = None
+    property_guess: Optional[str] = None
+    property_guess_source: Optional[str] = None
+    property_guess_confidence: Optional[float] = None
     desired_bedrooms: Optional[int] = None
     availability_shared: bool = False
     sister_route_offered: bool = False
@@ -28,12 +47,20 @@ class PlannerState:
     prospect_email: Optional[str] = None
     prospect_phone: Optional[str] = None
     availability_cache: List[Dict[str, Any]] = field(default_factory=list)
+    has_available_units: bool = False
+    sister_recommendation: Optional[Dict[str, Any]] = None
+    last_action: Optional[str] = None
+    last_tool_summary: Optional[str] = None
+    last_error: Optional[str] = None
+    last_units_viewed: List[str] = field(default_factory=list)
+    transcript_history: List[Dict[str, str]] = field(default_factory=list)
     # Additional conversation slots
     has_pets: Optional[bool] = None
     tour_type: Optional[str] = None  # "in_person" | "virtual"
     move_in_date: Optional[date] = None
     budget_min: Optional[int] = None
     budget_max: Optional[int] = None
+    target_rent: Optional[int] = None
     requested_time: Optional[datetime] = None
     
     # Call retention and booking objective tracking
@@ -50,6 +77,25 @@ class AgentPlanner:
         self.dispatcher = dispatcher
         self.recorder = recorder
         self.state = PlannerState()
+        self._state_client: Optional[AsyncOpenAI] = None
+        self._state_model = os.getenv("GROQ_STATE_MODEL", "openai/gpt-oss-20b")
+        api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if api_key:
+            self._state_client = AsyncOpenAI(
+                api_key=api_key,
+                base_url="https://api.groq.com/openai/v1",
+            )
+        self._response_cache = {
+            "get_property": "Hi! Which building are you interested in—21 West End, Hudson 360, or Riverview Lofts?",
+            "get_bedrooms_default": "Great! What size apartment—studio, 1BR, or 2BR?",
+            "get_bedrooms_21we": "Perfect! 21 West End is excellent. What size apartment—studio, 1BR, or 2BR?",
+            "get_bedrooms_hudson-360": "Great choice! Hudson 360 is modern. What size apartment—studio, 1BR, or 2BR?",
+            "get_bedrooms_riverview-lofts": "Excellent! Riverview Lofts has great views. What size apartment—studio, 1BR, or 2BR?",
+            "get_move_in": "Great! When would you like to move in? A specific date really helps me check availability.",
+            "get_budget": "Thanks! What's your ideal monthly budget so I can make sure I recommend the right options?",
+            "get_time": "Excellent! What day and time work for your tour? I have openings today, tomorrow, and this weekend.",
+            "get_contact": "Perfect! I just need your phone number or email to send the tour confirmation."
+        }
 
     async def process_transcript(self, transcript: str) -> Dict[str, str]:
         logger.info("planner.transcript %s", transcript)
@@ -61,16 +107,33 @@ class AgentPlanner:
         
         # Memory service removed - using session-only state management
         
-        # ALWAYS capture information from current transcript
-        logger.info("BEFORE capture - Property: %s, Bedrooms: %s", self.state.property_name, self.state.desired_bedrooms)
-        self._maybe_capture_contact(transcript)
-        self._identify_property(text)
-        self._capture_slots(transcript)
-        logger.info("AFTER capture - Property: %s, Bedrooms: %s", self.state.property_name, self.state.desired_bedrooms)
+        logger.info(
+            "BEFORE capture - Property: %s, Bedrooms: %s, Move-in: %s, Budget: %s, Time: %s",
+            self.state.property_name,
+            self.state.desired_bedrooms,
+            self.state.move_in_date,
+            self.state.target_rent,
+            self.state.requested_time,
+        )
+
+        await self._update_state_from_llm(transcript)
+
+        logger.info(
+            "AFTER capture - Property: %s, Bedrooms: %s, Move-in: %s, Budget: %s, Time: %s",
+            self.state.property_name,
+            self.state.desired_bedrooms,
+            self.state.move_in_date,
+            self.state.target_rent,
+            self.state.requested_time,
+        )
+
+        # Record user transcript in session memory
+        self.state.transcript_history.append({"role": "user", "text": transcript.strip()})
         
         # Create session summary and determine next action
         session_summary = await self._create_session_summary(transcript)
         next_action = self._determine_next_action()
+        booking_context = self._get_booking_requirements_context()
         
         logger.info("Session Summary: %s", session_summary)
         logger.info("Next Action: %s", next_action)
@@ -79,20 +142,12 @@ class AgentPlanner:
         response = await self._execute_action(next_action, text)
         
         # Add booking requirements context to help with tool selection
-        booking_context = self._get_booking_requirements_context()
-        
-        # Ensure response contains a question if tour not yet booked
-        missing = self._missing_booking_info()
-        if missing and not response["text"].endswith("?"):
-            # Add a question to gather missing info
-            next_question = self._get_next_question(missing[0])
-            if next_question and not next_question in response["text"]:
-                response["text"] = response["text"].rstrip(".") + f". {next_question}"
-        
-        # Add context for tool selection (this will be used by the OpenAI planner)
         response["booking_context"] = booking_context
-        response["missing_info"] = missing
+        response["missing_info"] = self._missing_booking_info()
         response["next_action"] = next_action
+
+        if response.get("text"):
+            self.state.transcript_history.append({"role": "agent", "text": response["text"].strip()})
         
         # Session state maintained without persistent memory
         logger.info("SESSION STATE - Property: %s, Bedrooms: %s, Phone: %s", 
@@ -104,8 +159,178 @@ class AgentPlanner:
         
         return response
 
+    async def _update_state_from_llm(self, transcript: str) -> None:
+        if not self._state_client:
+            return
+
+        history_text = "\n".join(
+            f"{turn['role']}: {turn['text']}" for turn in self.state.transcript_history[-12:]
+        )
+
+        state_snapshot = {
+            "property_id": self.state.property_id,
+            "property_name": self.state.property_name,
+            "desired_bedrooms": self.state.desired_bedrooms,
+            "move_in_date": self.state.move_in_date.isoformat() if self.state.move_in_date else None,
+            "budget_min": self.state.budget_min,
+            "budget_max": self.state.budget_max,
+            "target_rent": self.state.target_rent,
+            "requested_time": self.state.requested_time.isoformat() if self.state.requested_time else None,
+            "prospect_name": self.state.prospect_name,
+            "prospect_email": self.state.prospect_email,
+            "prospect_phone": self.state.prospect_phone,
+        }
+
+        context_text = (
+            "You update booking state for an apartment leasing agent.\n"
+            "Conversation history (newest last):\n"
+            f"{history_text or '(none)'}\n\n"
+            "Current captured state (JSON):\n"
+            f"{json.dumps(state_snapshot)}\n\n"
+            "Output ONLY a JSON object with the fields that changed in the latest caller utterance. "
+            "Leave fields out entirely if they did not change."
+        )
+        messages = [
+            {"role": "system", "content": "Extract leasing booking fields from the latest caller message."},
+            {"role": "assistant", "content": context_text},
+            {"role": "user", "content": transcript},
+        ]
+
+        schema = {
+            "name": "planner_state_delta",
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "property_name": {"type": ["string", "null"]},
+                    "desired_bedrooms": {"type": ["integer", "null"]},
+                    "move_in_date": {"type": ["string", "null"], "description": "ISO or natural language date"},
+                    "budget_min": {"type": ["number", "null"]},
+                    "budget_max": {"type": ["number", "null"]},
+                    "target_rent": {"type": ["number", "null"]},
+                    "prospect_name": {"type": ["string", "null"]},
+                    "prospect_email": {"type": ["string", "null"]},
+                    "prospect_phone": {"type": ["string", "null"]},
+                    "requested_time": {"type": ["string", "null"], "description": "ISO datetime or natural language"},
+                    "has_pets": {"type": ["boolean", "null"]},
+                    "tour_type": {"type": ["string", "null"], "enum": ["in_person", "virtual", None]},
+                    "reasoning": {"type": ["string", "null"]},
+                },
+                "required": [],
+            },
+        }
+
+        try:
+            response = await self._state_client.chat.completions.create(
+                model=self._state_model,
+                messages=messages,
+                response_format={"type": "json_schema", "json_schema": schema},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("state.llm_error %s", exc)
+            return
+
+        if not response.choices:
+            logger.info("state.extractor_no_output")
+            return
+
+        parsed_data: Dict[str, Any] = {}
+        message = response.choices[0].message
+        content_items = getattr(message, "content", None)
+        if isinstance(content_items, list):
+            for item in content_items:
+                if item.get("type") == "output_json":
+                    parsed_data = item.get("json", {}) or {}
+                    break
+                if item.get("type") == "text":
+                    try:
+                        parsed_data = json.loads(item.get("text", ""))
+                        break
+                    except json.JSONDecodeError:
+                        continue
+        else:
+            # Fallback for string responses
+            try:
+                parsed_data = json.loads(getattr(message, "content", "") or "{}")
+            except json.JSONDecodeError:
+                parsed_data = {}
+
+        if not parsed_data:
+            logger.info("state.extractor_no_parse")
+            return
+
+        reasoning = parsed_data.pop("reasoning", None)
+        if reasoning:
+            logger.info("state.extractor_reasoning %s", reasoning)
+
+        updates = {k: v for k, v in parsed_data.items() if v not in (None, "")}
+        if not updates:
+            logger.info("state.extractor_no_updates")
+            return
+
+        for field, value in updates.items():
+            if value in (None, ""):
+                continue
+            if field == "property_name":
+                self._identify_property(str(value).lower())
+            elif field == "desired_bedrooms":
+                self.state.desired_bedrooms = int(value)
+                self.state.last_action = "captured_bedrooms"
+            elif field == "move_in_date":
+                try:
+                    self.state.move_in_date = datetime.fromisoformat(value).date() if isinstance(value, str) else value
+                    self.state.last_action = "captured_move_in"
+                except Exception:  # noqa: BLE001
+                    logger.warning("state.extractor_invalid_move_in %s", value)
+            elif field in {"budget_min", "budget_max", "target_rent"}:
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    logger.warning("state.extractor_invalid_budget %s", value)
+                    continue
+                if field == "target_rent":
+                    self.state.target_rent = numeric
+                    self.state.budget_min = min(self.state.budget_min or numeric, numeric)
+                    self.state.budget_max = max(self.state.budget_max or numeric, numeric)
+                else:
+                    setattr(self.state, field, numeric)
+                    if self.state.target_rent is None:
+                        self.state.target_rent = numeric
+                self.state.last_action = "captured_budget"
+            elif field == "prospect_name":
+                self.state.prospect_name = str(value)
+                self.state.last_action = "captured_name"
+            elif field == "prospect_email":
+                self.state.prospect_email = str(value)
+                self.state.last_action = "captured_contact"
+            elif field == "prospect_phone":
+                digits = "".join(filter(str.isdigit, str(value)))
+                if len(digits) >= 10:
+                    self.state.prospect_phone = f"+1{digits[-10:]}"
+                    self.state.last_action = "captured_contact"
+            elif field == "requested_time":
+                try:
+                    parsed_time = value
+                    if isinstance(parsed_time, str):
+                        parsed_time = datetime.fromisoformat(parsed_time)
+                    if parsed_time.tzinfo is None:
+                        parsed_time = parsed_time.replace(tzinfo=tz.tzlocal())
+                    self.state.requested_time = parsed_time
+                    self.state.last_action = "captured_time"
+                except Exception:  # noqa: BLE001
+                    logger.warning("state.extractor_invalid_time %s", value)
+            elif field == "has_pets":
+                self.state.has_pets = bool(value)
+            elif field == "tour_type":
+                if value in {"in_person", "virtual"}:
+                    self.state.tour_type = value
+            elif field == "reasoning":
+                self.state.last_tool_summary = str(value)
+            else:
+                logger.debug("state.extractor_unhandled_field %s=%s", field, value)
+
     def _identify_property(self, text: str) -> None:
-        # Exact matches first
+        # Exact phrase matches
         exact_mapping = {
             "21 west end": ("21we", "21 West End"),
             "21we": ("21we", "21 West End"),
@@ -118,51 +343,80 @@ class AgentPlanner:
             "riverview lofts": ("riverview-lofts", "Riverview Lofts"),
         }
         
-        # Try exact matches first
+        # Pre-normalize known hyphen variations
+        normalized_text = text.replace("riverview loft", "riverview lofts")
+
         for phrase, (prop_id, name) in exact_mapping.items():
-            if phrase in text:
+            if phrase in normalized_text:
                 self.state.property_id = prop_id
                 self.state.property_name = name
-                logger.info("planner.property_identified %s from exact match '%s'", prop_id, text)
+                self.state.property_guess = None
+                self.state.property_guess_source = None
+                self.state.property_guess_confidence = None
+                self.state.sister_recommendation = None
+                self.state.last_action = "property_captured"
+                logger.info("planner.property_identified %s from exact match '%s'", prop_id, phrase)
                 return
         
-        # Fuzzy matching for common STT errors
-        fuzzy_patterns = [
-            # 21 West End variations (common STT errors)
-            (["21 best end", "21 vest end", "21 rest end", "21 west and", "twenty one best end", 
-              "twenty one vest end", "21 blessed", "21 blessed end", "cleveland west end", 
-              "21 worst end", "21 first west end", "20 first west end", "21 verse end"], ("21we", "21 West End")),
-            
-            # Hudson 360 variations  
-            (["hudson three sixty", "hudson 3 60", "hudson three six zero", "hudson tree sixty"], 
-             ("hudson-360", "Hudson 360")),
-            
-            # Riverview Lofts variations
-            (["river view lofts", "river view", "riverview loft", "river lofts"], 
-             ("riverview-lofts", "Riverview Lofts"))
-        ]
-        
-        for patterns, (prop_id, name) in fuzzy_patterns:
+        # Fuzzy fallback with difflib
+        candidates = {
+            "21 West End": ["21 west end", "twenty one west end", "21 west"],
+            "Hudson 360": ["hudson", "hudson three sixty", "hudson 360"],
+            "Riverview Lofts": ["riverview", "river view lofts", "river view", "riverview lofts"],
+        }
+
+        best_match = None
+        best_score = 0.0
+        for name, patterns in candidates.items():
             for pattern in patterns:
-                if pattern in text:
-                    self.state.property_id = prop_id
-                    self.state.property_name = name
-                    logger.info("planner.property_identified %s from fuzzy match '%s' -> '%s'", prop_id, pattern, name)
-                    return
+                score = SequenceMatcher(None, pattern, normalized_text).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_match = name
+
+        confidence_threshold = 0.70
+        if best_match and best_score >= confidence_threshold:
+            property_map = {
+                "21 West End": "21we",
+                "Hudson 360": "hudson-360",
+                "Riverview Lofts": "riverview-lofts",
+            }
+            prop_id = property_map[best_match]
+            self.state.property_id = prop_id
+            self.state.property_name = best_match
+            self.state.property_guess = None
+            self.state.property_guess_source = None
+            self.state.property_guess_confidence = None
+            self.state.sister_recommendation = None
+            self.state.last_action = "property_captured"
+            logger.info(
+                "planner.property_identified %s via fuzzy match score=%.2f text='%s'",
+                prop_id,
+                best_score,
+                text,
+            )
+            return
         
-        # If no match found, try partial word matching for very garbled text
-        if "21" in text and any(word in text for word in ["west", "best", "vest", "rest", "blessed"]):
-            self.state.property_id = "21we"
-            self.state.property_name = "21 West End"
-            logger.info("planner.property_identified %s from partial match in '%s'", "21we", text)
-        elif "hudson" in text:
-            self.state.property_id = "hudson-360"
-            self.state.property_name = "Hudson 360"
-            logger.info("planner.property_identified %s from partial match in '%s'", "hudson-360", text)
-        elif any(word in text for word in ["river", "riverview"]):
-            self.state.property_id = "riverview-lofts"
-            self.state.property_name = "Riverview Lofts"
-            logger.info("planner.property_identified %s from partial match in '%s'", "riverview-lofts", text)
+        if best_match:
+            property_map = {
+                "21 West End": "21we",
+                "Hudson 360": "hudson-360",
+                "Riverview Lofts": "riverview-lofts",
+            }
+            self.state.property_guess = property_map[best_match]
+            self.state.property_guess_source = best_match
+            self.state.property_guess_confidence = best_score
+            logger.info(
+                "planner.property_guess %s score=%.2f text='%s'",
+                self.state.property_guess,
+                best_score,
+                text,
+            )
+        else:
+            self.state.property_guess = None
+            self.state.property_guess_source = None
+            self.state.property_guess_confidence = None
+        
         bedrooms_mapping = {
             0: ["studio", "0 bedroom", "zero bedroom"],
             1: ["1 bedroom", "one bedroom", "1br", "1 br", "1 b r", "one br", "single bedroom"],
@@ -174,53 +428,158 @@ class AgentPlanner:
                 self.state.desired_bedrooms = count
                 break
 
-    def _respond_with_availability(self) -> str:
+    def _respond_with_availability(self) -> bool:
         assert self.state.property_id
-        args = AvailabilityQuery(property_id=self.state.property_id, bedrooms=self.state.desired_bedrooms)
-        with self.recorder.stage("PLAN", property_id=self.state.property_id):
-            availability = self.dispatcher.dispatch("check_availability", args.model_dump())
-        if availability:
-            self.state.availability_shared = True
-            self.state.availability_cache = availability
-            snippets = []
-            for unit in availability[:2]:
-                rent = unit.get("rent")
-                ner = unit.get("net_effective_rent")
-                snippets.append(
-                    f"{unit['unit_id']} at ${rent:,.0f} gross (${ner:,.0f} net effective) available {unit['available_on']}"
-                )
-            # Concise availability + single next question
-            response = (
-                f"I have {len(availability)} at {self.state.property_name}. "
-                + " | ".join(snippets[:1])
-                + ". What size—studio, 1BR, or 2BR?"
-            )
-            return response
-        self.recorder.log("PLAN", "no_availability", property_id=self.state.property_id)
-        return self._route_to_sister()
+        args = AvailabilityQuery(
+            property_id=self.state.property_id,
+            bedrooms=self.state.desired_bedrooms,
+            move_in_date=self.state.move_in_date,
+            limit=5,
+        )
+        try:
+            with self.recorder.stage("PLAN", property_id=self.state.property_id):
+                availability = self.dispatcher.dispatch("check_availability", args.model_dump())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("availability.error %s", exc)
+            self.state.last_error = f"availability_error: {exc}"
+            self.state.last_action = "availability_error"
+            return False
 
-    def _route_to_sister(self) -> str:
-        assert self.state.property_id
+        filtered: List[Dict[str, Any]] = []
+        for unit in availability:
+            rent = unit.get("rent")
+            if self.state.budget_min and rent and rent < self.state.budget_min:
+                continue
+            if self.state.budget_max and rent and rent > self.state.budget_max:
+                continue
+            if self.state.target_rent and rent and rent > self.state.target_rent:
+                continue
+            filtered.append(unit)
+
+        if not filtered:
+            self.recorder.log("PLAN", "no_availability", property_id=self.state.property_id)
+            self.state.availability_shared = False
+            self.state.last_tool_summary = f"NO_AVAILABILITY {self.state.property_name or self.state.property_id}"
+            self.state.has_available_units = False
+            self.state.availability_cache = []
+            self.state.last_units_viewed = []
+            return self._route_to_sister()
+
+        # We have matching units; surface the options immediately
+        self.state.availability_shared = True
+        self.state.availability_cache = filtered
+        self.state.last_units_viewed = [unit.get("unit_id", "?") for unit in filtered]
+        self.state.has_available_units = True
+
+        def _format_unit(unit: Dict[str, Any]) -> str:
+            rent = unit.get("rent")
+            ner = unit.get("net_effective_rent")
+            move_in = unit.get("available_on")
+            bedroom = unit.get("bedrooms")
+            parts = [unit.get("unit_id", "unit")]
+            if bedroom is not None:
+                parts.append(f"{bedroom}BR")
+            if rent is not None:
+                parts.append(f"${rent:,.0f}")
+            if ner is not None and ner != rent:
+                parts.append(f"(${ner:,.0f} net)")
+            if move_in:
+                parts.append(f"avail {move_in}")
+            return " ".join(parts)
+
+        top_units = " | ".join(_format_unit(unit) for unit in filtered[:2])
+        self.state.last_tool_summary = (
+            f"AVAILABILITY {self.state.property_name or self.state.property_id}: {top_units}"
+        )
+        self.state.last_action = "shared_availability"
+        return True
+
+    def _route_to_sister(self) -> bool:
+        target_property_id = self.state.property_id or self.state.property_guess
+        if not target_property_id:
+            self.state.last_action = "recommend_sister_unavailable"
+            return False
+
         request = SisterPropertyRouteRequest(
-            origin_property_id=self.state.property_id,
+            origin_property_id=target_property_id,
             bedrooms=self.state.desired_bedrooms,
         )
-        with self.recorder.stage("PLAN", origin=self.state.property_id):
-            options: List[Dict[str, str]] = self.dispatcher.dispatch("route_to_sister_property", request.model_dump())
+
+        try:
+            with self.recorder.stage("PLAN", origin=target_property_id):
+                options: List[Dict[str, Any]] = self.dispatcher.dispatch(
+                    "route_to_sister_property", request.model_dump()
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("sister.error %s", exc)
+            self.state.last_error = f"sister_error: {exc}"
+            self.state.last_action = "recommend_sister_error"
+            return False
+
         if not options:
-            return "I don't have alternatives right now, but I can take your info and follow up."
+            # Fallback to portfolio inventory data
+            sisters = portfolio.iter_sister_properties(target_property_id)
+            best_option: Optional[Dict[str, Any]] = None
+            for sister in sisters:
+                units = portfolio.list_units(sister.id)
+                if not units:
+                    continue
+                sorted_units = sorted(
+                    units,
+                    key=lambda u: (
+                        abs((u.bedrooms or 0) - (self.state.desired_bedrooms or u.bedrooms or 0)),
+                        u.available_on,
+                        u.rent,
+                    ),
+                )
+                unit = sorted_units[0]
+                best_option = {
+                    "property_id": sister.id,
+                    "name": sister.name,
+                    "unit_id": unit.unit_id,
+                    "bedrooms": unit.bedrooms,
+                    "rent": unit.rent,
+                    "available_on": unit.available_on.isoformat(),
+                    "distance_miles": None,
+                }
+                break
+            if best_option:
+                options = [best_option]
+
+        if not options:
+            self.state.last_action = "recommend_sister_unavailable"
+            self.state.last_tool_summary = "NO_SISTER_OPTION"
+            self.state.availability_shared = False
+            self.state.availability_cache = []
+            self.state.last_units_viewed = []
+            self.state.has_available_units = False
+            return False
+
         self.state.sister_route_offered = True
         top = options[0]
-        self.state.property_id = top["property_id"]
-        self.state.property_name = top["name"]
-        availability = top["available_units"]
-        self.state.availability_shared = True
-        self.state.availability_cache = availability
-        unit = availability[0]
-        return (
-            f"Nothing open there today, but {top['name']} is {top['distance_miles']} miles away with {unit['unit_id']} "
-            f"at ${unit['net_effective_rent']:,.0f} net effective. Want me to book a tour there?"
-        )
+        self.state.sister_recommendation = top
+        self.state.last_action = "recommend_sister"
+        self.state.availability_shared = False
+        self.state.availability_cache = []
+        self.state.last_units_viewed = []
+        self.state.has_available_units = False
+        summary_parts = [top.get("name", "Sister property")]
+        if top.get("unit_id"):
+            summary_parts.append(f"unit {top['unit_id']}")
+        bedrooms = top.get("bedrooms")
+        if bedrooms is not None:
+            summary_parts.append(f"{bedrooms}BR")
+        rent = top.get("rent")
+        if rent is not None:
+            summary_parts.append(f"${rent:,.0f}")
+        move_in = top.get("available_on")
+        if move_in:
+            summary_parts.append(f"avail {move_in}")
+        distance = top.get("distance_miles")
+        if distance is not None:
+            summary_parts.append(f"{distance}mi away")
+        self.state.last_tool_summary = "SISTER_OPTION " + " ".join(summary_parts)
+        return True
 
     def _book_tour(self, booking_time: datetime) -> Dict[str, str]:
         assert self.state.property_id and self.state.property_name
@@ -321,13 +680,20 @@ class AgentPlanner:
             logger.info("Trying to capture phone from: '%s'", transcript)
             for i, pattern in enumerate(phone_patterns):
                 phone_match = re.search(pattern, transcript)
-                logger.info("Pattern %d (%s): %s", i+1, pattern, "MATCH" if phone_match else "NO MATCH")
-                if phone_match:
-                    digits = "".join(filter(str.isdigit, phone_match.group(0)))
-                    if len(digits) >= 10:
-                        self.state.prospect_phone = f"+1{digits[-10:]}"
-                        logger.info("✅ CAPTURED PHONE: %s from text '%s' using pattern %d", self.state.prospect_phone, transcript, i+1)
-                        break
+                logger.info("Pattern %d (%s): %s", i + 1, pattern, "MATCH" if phone_match else "NO MATCH")
+                if not phone_match:
+                    continue
+                digits = "".join(filter(str.isdigit, phone_match.group(0)))
+                if len(digits) >= 10:
+                    self.state.prospect_phone = f"+1{digits[-10:]}"
+                    logger.info(
+                        "✅ CAPTURED PHONE: %s from text '%s' using pattern %d",
+                        self.state.prospect_phone,
+                        transcript,
+                        i + 1,
+                    )
+                    self.state.last_action = "captured_contact_phone"
+                    break
             
             if not self.state.prospect_phone:
                 logger.warning("❌ FAILED to capture phone from: '%s'", transcript)
@@ -343,13 +709,16 @@ class AgentPlanner:
             
             for pattern in name_patterns:
                 name_match = re.search(pattern, transcript.lower())
-                if name_match:
-                    name = name_match.group(1).strip().title()
-                    # Filter out common non-names
-                    if name and len(name.split()) <= 3 and not any(word in name.lower() for word in ["interested", "looking", "calling", "here"]):
-                        self.state.prospect_name = name
-                        logger.info("Captured name: %s", self.state.prospect_name)
-                        break
+                if not name_match:
+                    continue
+                name = name_match.group(1).strip().title()
+                if name and len(name.split()) <= 3 and not any(
+                    word in name.lower() for word in ["interested", "looking", "calling", "here"]
+                ):
+                    self.state.prospect_name = name
+                    logger.info("Captured name: %s", self.state.prospect_name)
+                    self.state.last_action = "captured_name"
+                    break
 
     def _detect_booking_intent(self, text: str) -> bool:
         """Detect if user wants to book a tour"""
@@ -390,7 +759,7 @@ class AgentPlanner:
         """Get property identification prompt with urgency"""
         if self.state.conversation_turns > 2:
             return "I want to help you find the perfect place! Which building caught your eye - 21 West End, Hudson 360, or Riverview Lofts? I can check live availability right now."
-        else:
+
             return "Hi! Which building are you interested in touring from our portfolio?"
     
     def _handle_booking_request(self, text: str) -> Dict[str, str]:
@@ -405,11 +774,15 @@ class AgentPlanner:
         
         # Try to parse specific time
         if "saturday" in text or "tomorrow" in text or any(day in text for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]):
-            booking_time = _parse_requested_time(text)
-            confirmation = self._book_tour(booking_time)
-            return {
-                "text": f"Locked for {confirmation['tour_time']}. I just sent your confirmation."
-            }
+            # Groq should call planner_set_tour_time; this fallback handles rare misses
+            parsed_time = dateparser.parse(text, fuzzy=True)
+            if parsed_time and parsed_time.tzinfo is None:
+                parsed_time = parsed_time.replace(tzinfo=tz.tzlocal())
+            if parsed_time:
+                confirmation = self._book_tour(parsed_time)
+                return {
+                    "text": f"Locked for {confirmation['tour_time']}. I just sent your confirmation."
+                }
         
         # Ask for specific time if not provided
         if self.state.requested_time is None:
@@ -454,71 +827,13 @@ class AgentPlanner:
         """Update state from freeform transcript without producing a response or calling tools."""
         self.state.conversation_turns += 1
         self.state.last_engagement_time = datetime.now()
-        self._maybe_capture_contact(transcript)
-        self._identify_property(transcript.lower())
-        self._capture_slots(transcript)
         self._log_state()
+        self.state.last_action = "ingest"
 
-    def _capture_slots(self, transcript: str) -> None:
-        text = transcript.lower()
-        # Pets
-        if any(word in text for word in ["pet", "pets", "dog", "cat"]):
-            self.state.has_pets = True
-        # Tour type
-        if "virtual" in text:
-            self.state.tour_type = "virtual"
-        if "in person" in text or "in-person" in text or "inperson" in text:
-            self.state.tour_type = "in_person"
-        # Budget (simple extraction of dollar amounts/range)
-        dollars = re.findall(r"\$\s*([0-9]{3,5})", transcript)
-        nums = [int(n) for n in dollars]
-        if len(nums) == 1:
-            self.state.budget_min = nums[0]
-        elif len(nums) >= 2:
-            lo, hi = sorted(nums[:2])
-            self.state.budget_min, self.state.budget_max = lo, hi
-        # Move-in date
-        if any(kw in text for kw in ["move in", "move-in", "movein", "start", "begin", "lease begins"]):
-            try:
-                dt = dateparser.parse(transcript, fuzzy=True)
-                if dt:
-                    self.state.move_in_date = dt.date()
-            except Exception:  # noqa: BLE001
-                pass
-        # Desired bedrooms (including common STT variations)
-        bedrooms_mapping = {
-            0: ["studio", "0 bedroom", "zero bedroom"],
-            1: ["1 bedroom", "one bedroom", "1br", "1 br", "1 b r", "one br", "single bedroom"],
-            2: ["2 bedroom", "two bedroom", "2br", "2 br", "2 b r", "two br", "double bedroom"],
-            3: ["3 bedroom", "three bedroom", "3br", "3 br", "3 b r", "three br", "triple bedroom"],
-        }
-        for count, keywords in bedrooms_mapping.items():
-            if any(keyword in text for keyword in keywords):
-                self.state.desired_bedrooms = count
-                break
-        # Requested tour time - look for day keywords
-        if any(day in text for day in ["saturday", "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "weekend", "weekday", "tomorrow"]):
-            try:
-                parsed = dateparser.parse(transcript, fuzzy=True)
-                if parsed:
-                    # Set default time to 11am if no time specified
-                    if parsed.hour == 0 and parsed.minute == 0:
-                        parsed = parsed.replace(hour=11, minute=0)
-                    self.state.requested_time = parsed
-            except Exception:  # noqa: BLE001
-                # Fallback for simple day parsing
-                if "saturday" in text:
-                    base = datetime.now().replace(hour=11, minute=0, second=0, microsecond=0)
-                    days_ahead = (5 - base.weekday()) % 7  # Saturday is weekday 5
-                    if days_ahead == 0:
-                        days_ahead = 7
-                    self.state.requested_time = base + timedelta(days=days_ahead)
-                elif "sunday" in text:
-                    base = datetime.now().replace(hour=11, minute=0, second=0, microsecond=0)
-                    days_ahead = (6 - base.weekday()) % 7  # Sunday is weekday 6
-                    if days_ahead == 0:
-                        days_ahead = 7
-                    self.state.requested_time = base + timedelta(days=days_ahead)
+    def _fallback_slot_capture(self, transcript: str) -> None:
+        """Fallback slot capture when the LLM extractor skips updates."""
+        return
+
 
     def _missing_booking_info(self) -> List[str]:
         missing: List[str] = []
@@ -526,6 +841,10 @@ class AgentPlanner:
             missing.append("property")
         if self.state.desired_bedrooms is None:
             missing.append("bedrooms")
+        if self.state.move_in_date is None:
+            missing.append("move_in")
+        if self.state.target_rent is None:
+            missing.append("budget")
         if self.state.requested_time is None:
             missing.append("time")
         if not (self.state.prospect_phone or self.state.prospect_email):
@@ -538,17 +857,28 @@ class AgentPlanner:
             "property": self.state.property_name or "NOT SET",
             "bedrooms": f"{self.state.desired_bedrooms}BR" if self.state.desired_bedrooms is not None else "NOT SET",
             "availability": "SHOWN" if self.state.availability_shared else "NOT SHOWN",
+            "move_in": self.state.move_in_date.isoformat() if self.state.move_in_date else "NOT SET",
+            "budget": f"${self.state.target_rent:,}" if self.state.target_rent else "NOT SET",
             "time": self.state.requested_time.strftime("%A %I:%M %p") if self.state.requested_time else "NOT SET",
             "contact": (self.state.prospect_phone or self.state.prospect_email or "NOT SET")
         }
         
         missing = self._missing_booking_info()
+
+        if self.state.property_guess and not self.state.property_id:
+            guess_conf = f"~{int((self.state.property_guess_confidence or 0.0) * 100)}%"
+            guess_text = f"{self.state.property_guess_source} ({guess_conf})"
+        else:
+            guess_text = "NONE"
         
         context_parts = [
             "BOOKING REQUIREMENTS STATUS:",
             f"Property: {required_info['property']}",
+            f"Property Guess: {guess_text}",
             f"Bedrooms: {required_info['bedrooms']}",
             f"Availability: {required_info['availability']}",
+            f"Move-In: {required_info['move_in']}",
+            f"Budget: {required_info['budget']}",
             f"Tour Time: {required_info['time']}",
             f"Contact Info: {required_info['contact']}",
             f"MISSING: {', '.join(missing).upper() if missing else 'NONE - READY TO BOOK'}",
@@ -562,10 +892,15 @@ class AgentPlanner:
         questions = {
             "property": "Which building interests you—21 West End, Hudson 360, or Riverview Lofts?",
             "bedrooms": "What size apartment—studio, 1BR, or 2BR?",
-            "time": "What day and time work for your tour?",
-            "contact": "What's your phone number or email for the confirmation?"
+            "move_in": "When would you like to move in? A specific date helps me check availability.",
+            "budget": "What's your ideal monthly budget so I can target the best fits?",
+            "time": "What day and time should I book your tour?",
+            "contact": "What's the best phone or email for your confirmation?",
         }
-        return questions.get(missing_info, "What else do you need to know?")
+        if missing_info in questions:
+            return questions[missing_info]
+        fallback = self._prompt_for_missing([missing_info])
+        return fallback if fallback else "Could you share a bit more so I can keep moving?"
 
     def _prompt_for_missing(self, missing: List[str]) -> str:
         prompts: List[str] = []
@@ -573,6 +908,10 @@ class AgentPlanner:
             prompts.append("Which building are you interested in—21 West End, Hudson 360, or Riverview Lofts?")
         if "bedrooms" in missing:
             prompts.append("What size are you looking for—studio, 1BR, or 2BR?")
+        if "move_in" in missing:
+            prompts.append("When would you like to move in? Knowing the date lets me check availability.")
+        if "budget" in missing:
+            prompts.append("What's your ideal monthly budget so I can target the best fits?")
         if "time" in missing:
             prompts.append("What day and time should I book your tour? For example, 'tomorrow at 11am'.")
         if "contact" in missing:
@@ -660,46 +999,66 @@ class AgentPlanner:
                 # Bedrooms already captured, move to next step
                 return await self._execute_action("show_availability", text)
             else:
-                response["text"] = f"Perfect! {self.state.property_name} is excellent. What size apartment—studio, 1BR, or 2BR?"
+                cache_key = f"get_bedrooms_{self.state.property_id}" if self.state.property_id else "get_bedrooms_default"
+                response["text"] = self._response_cache.get(cache_key, self._response_cache["get_bedrooms_default"])
+        
+        if not self.state.availability_shared and self.state.desired_bedrooms is not None:
+            if self.state.move_in_date is None:
+                response["text"] = self._response_cache["get_move_in"]
+                return response
+            if self.state.target_rent is None:
+                response["text"] = self._response_cache["get_budget"]
+                return response
+            if self._respond_with_availability():
+                response["text"] = self.state.last_tool_summary or "Let me know if one of these works."
+                return response
+            response["text"] = self.state.last_tool_summary or "I'm sorry, I didn't see anything open yet."
+            return response
         
         elif action == "show_availability":
-            availability_response = self._respond_with_availability()
-            response["text"] = availability_response
+            if self.state.move_in_date is None:
+                response["text"] = self._response_cache["get_move_in"]
+                return response
+            if self.state.target_rent is None:
+                response["text"] = self._response_cache["get_budget"]
+                return response
+            if self._respond_with_availability():
+                response["text"] = self.state.last_tool_summary or "Let me know if one of these works."
+                return response
+            # If availability failed (no matches, sister recommended), rely on summary already set
+            response["text"] = self.state.last_tool_summary or "I'm sorry, I didn't see anything open yet."
         
         elif action == "get_time":
-            # Try to parse any time information from the current text
-            if any(word in text for word in ["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "morning", "afternoon", "evening"]):
-                parsed_time = _parse_requested_time(text)
-                if parsed_time:
-                    self.state.requested_time = parsed_time
-                    return await self._execute_action("get_contact", text)
-            
-            if any(word in text for word in ["week", "next week", "upcoming"]):
-                response["text"] = "Great! What specific day works best—Monday through Friday, or would you prefer a weekend tour?"
+            if not (self.state.availability_shared or self.state.sister_recommendation):
+                response["text"] = "Let me walk you through some options first, then we can lock a time."
             else:
-                response["text"] = "Excellent! What day and time work for your tour? I have openings today, tomorrow, and this weekend."
+                response["text"] = self._response_cache["get_time"]
         
         elif action == "get_contact":
-            # Check if contact info was just provided
-            if self.state.prospect_phone or self.state.prospect_email:
-                # Contact info captured, proceed to book
+            if not (self.state.availability_shared or self.state.sister_recommendation):
+                response["text"] = "Once you pick the apartment you like, I'll grab your phone or email for confirmation."
+            elif self.state.prospect_phone or self.state.prospect_email:
                 return await self._execute_action("book_tour", text)
             elif any(phrase in text for phrase in ["already gave", "already provided", "i gave you", "you have my"]):
-                # User claims they already provided contact info - check if we missed it
                 logger.warning("User claims contact already provided, but we don't have it. Missing: phone=%s, email=%s", 
-                              not self.state.prospect_phone, not self.state.prospect_email)
-                response["text"] = "I apologize, I don't see your contact info. Could you please provide your phone number or email again?"
+                               self.state.prospect_phone, self.state.prospect_email)
+                response["text"] = "I couldn't find it—could you share your phone or email one more time?"
             else:
-                response["text"] = "Perfect! I just need your phone number or email to send the tour confirmation."
+                response["text"] = self._response_cache["get_contact"]
         
         elif action == "book_tour":
-            # We have everything needed - book the tour
+            if not self.state.availability_shared or not self.state.has_available_units:
+                return {
+                    "text": "I don't have any confirmed availability yet. Want me to look at a nearby sister property instead?"
+                }
+
             if not self.state.requested_time:
-                # Try to parse time from current text
-                self.state.requested_time = _parse_requested_time(text)
+                fallback_time = dateparser.parse(text, fuzzy=True)
+                if fallback_time and fallback_time.tzinfo is None:
+                    fallback_time = fallback_time.replace(tzinfo=tz.tzlocal())
+                self.state.requested_time = fallback_time
             
             if self.state.requested_time and (self.state.prospect_phone or self.state.prospect_email):
-                # We have time and contact info - book it!
                 try:
                     confirmation = self._book_tour(self.state.requested_time)
                     contact = self.state.prospect_phone or self.state.prospect_email
@@ -755,60 +1114,205 @@ class AgentPlanner:
             phone=self.state.prospect_phone,
         )
 
+    # --- LLM Tooling Interface ---
+
+    def get_llm_tool_schemas(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "name": "planner_set_property",
+                "description": "Record the property the caller wants to tour.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "property_name": {"type": "string", "description": "Name of the property the caller mentioned."}
+                    },
+                    "required": ["property_name"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "planner_set_bedrooms",
+                "description": "Store the desired bedroom count.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "bedrooms": {"type": "integer", "minimum": 0, "maximum": 5},
+                    },
+                    "required": ["bedrooms"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "planner_set_move_in_date",
+                "description": "Record the caller's target move-in date.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "move_in_date": {"type": "string", "description": "ISO date or natural language date."}
+                    },
+                    "required": ["move_in_date"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "planner_set_budget",
+                "description": "Store the caller's monthly budget range.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "min_amount": {"type": "number"},
+                        "max_amount": {"type": "number"},
+                    },
+                    "required": [],
+                },
+            },
+            {
+                "type": "function",
+                "name": "planner_set_contact",
+                "description": "Store the caller's contact information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone": {"type": "string"},
+                        "email": {"type": "string"},
+                    },
+                    "required": [],
+                },
+            },
+            {
+                "type": "function",
+                "name": "planner_set_tour_time",
+                "description": "Store the requested tour datetime.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tour_time": {"type": "string", "description": "Preferred tour datetime in natural language or ISO."}
+                    },
+                    "required": ["tour_time"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "planner_check_availability",
+                "description": "Check availability for the stored property, bedrooms, move-in date, and budget.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "name": "planner_recommend_sister",
+                "description": "Recommend a sister property when primary property has no matches.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "name": "planner_end_session",
+                "description": "Politely end the call when no viable tour can be booked.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def execute_llm_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        handlers = {
+            "planner_set_property": self._llm_set_property,
+            "planner_set_bedrooms": self._llm_set_bedrooms,
+            "planner_set_move_in_date": self._llm_set_move_in_date,
+            "planner_set_budget": self._llm_set_budget,
+            "planner_set_contact": self._llm_set_contact,
+            "planner_set_tour_time": self._llm_set_tour_time,
+            "planner_check_availability": self._llm_check_availability,
+            "planner_recommend_sister": self._llm_recommend_sister,
+            "planner_end_session": self._llm_end_session,
+        }
+        handler = handlers.get(name)
+        if not handler:
+            raise ValueError(f"Unknown planner tool: {name}")
+        try:
+            return handler(arguments or {})
+        except ValidationError as exc:
+            return {"error": exc.errors()}
+
+    def _llm_set_property(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        payload = PropertyUpdate(**args)
+        before = self.state.property_name
+        self._identify_property(payload.property_name.lower())
+        if self.state.property_name and self.state.property_name != before:
+            return {"text": f"Noted {self.state.property_name}."}
+        return {"text": "I'm not sure which building that is; could you name the property again?"}
+
+    def _llm_set_bedrooms(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        payload = BedroomUpdate(**args)
+        self.state.desired_bedrooms = int(payload.desired_bedrooms)
+        self.state.last_action = "captured_bedrooms"
+        return {"text": f"Got it—{payload.desired_bedrooms} bedroom."}
+
+    def _llm_set_move_in_date(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        payload = MoveInUpdate(**args)
+        self.state.move_in_date = payload.move_in_date
+        self.state.last_action = "captured_move_in"
+        return {"text": f"Move-in logged for {payload.move_in_date.isoformat()}."}
+
+    def _llm_set_budget(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        payload = BudgetUpdate(**args)
+        min_amount = payload.min_amount
+        max_amount = payload.max_amount
+        if min_amount is None and max_amount is None:
+            return {"text": "Just checking—what budget works for you?"}
+        if min_amount is not None and max_amount is None:
+            max_amount = min_amount
+        if max_amount is not None and min_amount is None:
+            min_amount = max_amount
+        if min_amount is not None and max_amount is not None:
+            if min_amount > max_amount:
+                min_amount, max_amount = max_amount, min_amount
+            self.state.budget_min = float(min_amount)
+            self.state.budget_max = float(max_amount)
+            self.state.target_rent = float(max_amount)
+            self.state.last_action = "captured_budget"
+            if min_amount == max_amount:
+                return {"text": f"Budget noted at ${max_amount:,.0f}."}
+            return {"text": f"Budget range set for ${min_amount:,.0f}-${max_amount:,.0f}."}
+        return {"text": "I couldn't tell the budget—could you restate it?"}
+
+    def _llm_set_contact(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        payload = ContactUpdate(**args)
+        phone = payload.phone
+        email = payload.email
+        if not phone and not email:
+            return {"text": "Let me know the best phone or email when you can."}
+        if phone:
+            digits = "".join(filter(str.isdigit, phone))
+            if len(digits) >= 10:
+                self.state.prospect_phone = f"+1{digits[-10:]}"
+        if email:
+            self.state.prospect_email = email
+        self.state.last_action = "captured_contact"
+        contact = self.state.prospect_phone or self.state.prospect_email
+        return {"text": f"Thanks! I'll use {contact} for confirmation." if contact else "Thanks, I'll hold onto that."}
+
+    def _llm_set_tour_time(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        payload = TourTimeUpdate(**args)
+        parsed = payload.tour_time
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=tz.tzlocal())
+        self.state.requested_time = parsed
+        self.state.last_action = "captured_time"
+        return {"text": f"Tour time saved for {parsed.strftime('%A %b %d at %I:%M %p')}."}
+
+    def _llm_check_availability(self, _: Dict[str, Any]) -> Dict[str, Any]:
+        success = self._respond_with_availability()
+        summary = self.state.last_tool_summary or "No availability yet."
+        return {"text": summary if success else summary}
+
+    def _llm_recommend_sister(self, _: Dict[str, Any]) -> Dict[str, Any]:
+        success = self._route_to_sister()
+        summary = self.state.last_tool_summary or "No sister options available."
+        return {"text": summary}
+
+    def _llm_end_session(self, _: Dict[str, Any]) -> Dict[str, Any]:
+        self.state.last_action = "ended_session"
+        return {"text": "Understood—I'll pause here. Feel free to reach out if you'd like to explore other options."}
+
     # Memory service methods removed - using session-only state management
 
 
-def _upcoming_weekday_delta(target_weekday: int) -> timedelta:
-    today_weekday = datetime.now().weekday()
-    days_ahead = target_weekday - today_weekday
-    if days_ahead <= 0:
-        days_ahead += 7
-    return timedelta(days=days_ahead)
-
-
-def _parse_requested_time(text: str) -> datetime:
-    """Parse flexible time requests with smart defaults"""
-    try:
-        # Try to parse the text
-        parsed_time = dateparser.parse(text, fuzzy=True)
-        if parsed_time:
-            # If no time specified, default to 11am
-            if parsed_time.hour == 0 and parsed_time.minute == 0:
-                parsed_time = parsed_time.replace(hour=11, minute=0)
-            return parsed_time
-    except (ValueError, OverflowError):
-        pass
-    
-    # Smart defaults based on keywords
-    base_date = datetime.now()
-    
-    if "saturday" in text.lower():
-        days_until_saturday = (5 - base_date.weekday()) % 7
-        if days_until_saturday == 0:
-            days_until_saturday = 7  # Next Saturday if today is Saturday
-        target_date = base_date + timedelta(days=days_until_saturday)
-    elif "sunday" in text.lower():
-        days_until_sunday = (6 - base_date.weekday()) % 7
-        if days_until_sunday == 0:
-            days_until_sunday = 7  # Next Sunday if today is Sunday
-        target_date = base_date + timedelta(days=days_until_sunday)
-    elif "tomorrow" in text.lower():
-        target_date = base_date + timedelta(days=1)
-    else:
-        # Default to next Saturday
-        days_until_saturday = (5 - base_date.weekday()) % 7
-        if days_until_saturday == 0:
-            days_until_saturday = 7
-        target_date = base_date + timedelta(days=days_until_saturday)
-    
-    # Set time based on keywords
-    if "morning" in text.lower() or "10" in text or "11" in text:
-        hour = 11
-    elif "afternoon" in text.lower() or "1" in text or "2" in text:
-        hour = 14  # 2pm
-    elif "evening" in text.lower() or "4" in text or "5" in text:
-        hour = 16  # 4pm
-    else:
-        hour = 11  # Default to 11am
-    
-    return target_date.replace(hour=hour, minute=0, second=0, microsecond=0)

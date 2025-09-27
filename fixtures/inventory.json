@@ -4,8 +4,8 @@
     "unit_id": "21we-3207",
     "bedrooms": 2,
     "bathrooms": 2,
-    "rent": 6200,
-    "available_on": "2024-04-01",
+    "rent": 7200,
+    "available_on": "2025-11-15",
     "concessions": {"weeks_free": 4, "term_months": 12},
     "sq_ft": 1075
   },
@@ -14,10 +14,20 @@
     "unit_id": "21we-2803",
     "bedrooms": 1,
     "bathrooms": 1,
-    "rent": 4825,
-    "available_on": "2024-03-25",
+    "rent": 5200,
+    "available_on": "2025-10-05",
     "concessions": {"weeks_free": 6, "term_months": 15},
     "sq_ft": 780
+  },
+  {
+    "property_id": "21we",
+    "unit_id": "21we-1105",
+    "bedrooms": 0,
+    "bathrooms": 1,
+    "rent": 4100,
+    "available_on": "2025-08-20",
+    "concessions": {"weeks_free": 2, "term_months": 12},
+    "sq_ft": 540
   },
   {
     "property_id": "hudson-360",
@@ -40,6 +50,16 @@
     "sq_ft": 520
   },
   {
+    "property_id": "hudson-360",
+    "unit_id": "hudson-360-2107",
+    "bedrooms": 1,
+    "bathrooms": 1,
+    "rent": 4100,
+    "available_on": "2025-09-15",
+    "concessions": {"weeks_free": 1, "term_months": 12},
+    "sq_ft": 700
+  },
+  {
     "property_id": "riverview-lofts",
     "unit_id": "riverview-1502",
     "bedrooms": 2,
@@ -48,5 +68,15 @@
     "available_on": "2024-04-10",
     "concessions": {"weeks_free": 8, "term_months": 18},
     "sq_ft": 1010
+  },
+  {
+    "property_id": "riverview-lofts",
+    "unit_id": "riverview-0904",
+    "bedrooms": 1,
+    "bathrooms": 1,
+    "rent": 3950,
+    "available_on": "2025-09-05",
+    "concessions": {"weeks_free": 0, "term_months": 12},
+    "sq_ft": 760
   }
 ]

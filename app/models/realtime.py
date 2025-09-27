@@ -28,6 +28,7 @@ class AgentResponse(BaseModel):
     barge_in: bool = False
     tts_audio_b64: Optional[str] = None
     tool_calls: List["ToolCallRequest"] = Field(default_factory=list)
+    tools: List["ToolCallResult"] = Field(default_factory=list)
 
 
 class ToolCallRequest(BaseModel):
