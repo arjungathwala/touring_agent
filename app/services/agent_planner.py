@@ -49,6 +49,8 @@ class PlannerState:
     availability_cache: List[Dict[str, Any]] = field(default_factory=list)
     has_available_units: bool = False
     sister_recommendation: Optional[Dict[str, Any]] = None
+    selected_unit: Optional[Dict[str, Any]] = None
+    last_recommendation_reason: Optional[str] = None
     last_action: Optional[str] = None
     last_tool_summary: Optional[str] = None
     last_error: Optional[str] = None
@@ -459,17 +461,46 @@ class AgentPlanner:
         if not filtered:
             self.recorder.log("PLAN", "no_availability", property_id=self.state.property_id)
             self.state.availability_shared = False
-            self.state.last_tool_summary = f"NO_AVAILABILITY {self.state.property_name or self.state.property_id}"
             self.state.has_available_units = False
             self.state.availability_cache = []
             self.state.last_units_viewed = []
-            return self._route_to_sister()
+
+            self.state.last_recommendation_reason = "NO_MATCH_PRIMARY"
+            recommended = self._route_to_sister()
+            if recommended and self.state.sister_recommendation:
+                sister = self.state.sister_recommendation
+                unit_label = sister.get("unit_id") or "a unit"
+                sister_bed = sister.get("bedrooms")
+                sister_bed_text = f"{sister_bed}BR " if sister_bed is not None else ""
+                sister_rent = sister.get("rent")
+                sister_rent_text = f" for ${sister_rent:,.0f}" if sister_rent else ""
+                criteria_parts = [
+                    f"a {self.state.desired_bedrooms or ''}BR".strip(),
+                ]
+                if self.state.move_in_date:
+                    criteria_parts.append(f"available around {self.state.move_in_date.isoformat()}")
+                if self.state.target_rent:
+                    criteria_parts.append(f"near ${self.state.target_rent:,.0f}")
+                criteria_text = " with ".join([p for p in criteria_parts if p])
+                reason_text = (
+                    f"I couldn't find {criteria_text or 'an available unit'} at {self.state.property_name or 'that property'}. "
+                    f"A good alternative is {sister.get('name', 'a sister property')} {unit_label} ({sister_bed_text.strip() or ''}{sister_rent_text})"
+                ).strip()
+                self.state.last_tool_summary = reason_text
+            else:
+                self.state.last_tool_summary = (
+                    f"I couldn't find any matching availability at {self.state.property_name or 'that property'}, "
+                    "and there were no sister properties with similar options right now."
+                )
+            return recommended
 
         # We have matching units; surface the options immediately
         self.state.availability_shared = True
         self.state.availability_cache = filtered
         self.state.last_units_viewed = [unit.get("unit_id", "?") for unit in filtered]
         self.state.has_available_units = True
+        self.state.selected_unit = filtered[0]
+        self.state.last_recommendation_reason = "PRIMARY_AVAILABILITY"
 
         def _format_unit(unit: Dict[str, Any]) -> str:
             rent = unit.get("rent")
@@ -553,6 +584,7 @@ class AgentPlanner:
             self.state.availability_cache = []
             self.state.last_units_viewed = []
             self.state.has_available_units = False
+            self.state.sister_recommendation = None
             return False
 
         self.state.sister_route_offered = True
@@ -563,7 +595,9 @@ class AgentPlanner:
         self.state.availability_cache = []
         self.state.last_units_viewed = []
         self.state.has_available_units = False
-        summary_parts = [top.get("name", "Sister property")]
+        self.state.selected_unit = top
+        self.state.last_recommendation_reason = "SISTER_AVAILABILITY"
+        summary_parts = [top.get("name", "a sister property")]
         if top.get("unit_id"):
             summary_parts.append(f"unit {top['unit_id']}")
         bedrooms = top.get("bedrooms")
@@ -574,11 +608,11 @@ class AgentPlanner:
             summary_parts.append(f"${rent:,.0f}")
         move_in = top.get("available_on")
         if move_in:
-            summary_parts.append(f"avail {move_in}")
+            summary_parts.append(f"available {move_in}")
         distance = top.get("distance_miles")
         if distance is not None:
             summary_parts.append(f"{distance}mi away")
-        self.state.last_tool_summary = "SISTER_OPTION " + " ".join(summary_parts)
+        self.state.last_tool_summary = " ".join(summary_parts)
         return True
 
     def _book_tour(self, booking_time: datetime) -> Dict[str, str]:
@@ -780,9 +814,9 @@ class AgentPlanner:
                 parsed_time = parsed_time.replace(tzinfo=tz.tzlocal())
             if parsed_time:
                 confirmation = self._book_tour(parsed_time)
-                return {
-                    "text": f"Locked for {confirmation['tour_time']}. I just sent your confirmation."
-                }
+            return {
+                "text": f"Locked for {confirmation['tour_time']}. I just sent your confirmation."
+            }
         
         # Ask for specific time if not provided
         if self.state.requested_time is None:
@@ -1010,9 +1044,22 @@ class AgentPlanner:
                 response["text"] = self._response_cache["get_budget"]
                 return response
             if self._respond_with_availability():
-                response["text"] = self.state.last_tool_summary or "Let me know if one of these works."
+                summary = self.state.last_tool_summary or "Let me know if one of these works."
+                response["text"] = summary
                 return response
-            response["text"] = self.state.last_tool_summary or "I'm sorry, I didn't see anything open yet."
+            reason_bits = [
+                "I'm not seeing anything at",
+                self.state.property_name or "that property",
+                "meeting",
+                f"{self.state.desired_bedrooms or ''}BR",
+            ]
+            if self.state.move_in_date:
+                reason_bits.extend(["for a", self.state.move_in_date.isoformat(), "move-in"])
+            if self.state.target_rent:
+                reason_bits.extend(["around", f"${self.state.target_rent:,.0f}"])
+            sister = self.state.last_tool_summary or "A nearby sister property may fit better."
+            response["text"] = " ".join(reason_bits).strip() + f". {sister}"
+            self.state.last_recommendation_reason = "NO_MATCH_PRIMARY"
             return response
         
         elif action == "show_availability":
@@ -1025,8 +1072,19 @@ class AgentPlanner:
             if self._respond_with_availability():
                 response["text"] = self.state.last_tool_summary or "Let me know if one of these works."
                 return response
-            # If availability failed (no matches, sister recommended), rely on summary already set
-            response["text"] = self.state.last_tool_summary or "I'm sorry, I didn't see anything open yet."
+            reason_bits = [
+                "I'm not seeing anything at",
+                self.state.property_name or "that property",
+                "meeting",
+                f"{self.state.desired_bedrooms or ''}BR",
+            ]
+            if self.state.move_in_date:
+                reason_bits.extend(["for a", self.state.move_in_date.isoformat(), "move-in"])
+            if self.state.target_rent:
+                reason_bits.extend(["around", f"${self.state.target_rent:,.0f}"])
+            sister = self.state.last_tool_summary or "A nearby sister property may fit better."
+            response["text"] = " ".join(reason_bits).strip() + f". {sister}"
+            self.state.last_recommendation_reason = "NO_MATCH_PRIMARY"
         
         elif action == "get_time":
             if not (self.state.availability_shared or self.state.sister_recommendation):
@@ -1048,8 +1106,9 @@ class AgentPlanner:
         
         elif action == "book_tour":
             if not self.state.availability_shared or not self.state.has_available_units:
+                reason = self.state.last_tool_summary or "I couldn't find a direct match there."
                 return {
-                    "text": "I don't have any confirmed availability yet. Want me to look at a nearby sister property instead?"
+                    "text": f"{reason} Would you like to go with one of the sister-property options I mentioned?"
                 }
 
             if not self.state.requested_time:
@@ -1059,10 +1118,15 @@ class AgentPlanner:
                 self.state.requested_time = fallback_time
             
             if self.state.requested_time and (self.state.prospect_phone or self.state.prospect_email):
+                unit_to_book = self.state.selected_unit or (self.state.availability_cache[0] if self.state.availability_cache else None)
                 try:
                     confirmation = self._book_tour(self.state.requested_time)
+                    if unit_to_book:
+                        confirmation["unit_id"] = unit_to_book.get("unit_id")
+                        self.state.selected_unit = unit_to_book
                     contact = self.state.prospect_phone or self.state.prospect_email
-                    response["text"] = f"Perfect! You're booked for {confirmation['tour_time']} at {self.state.property_name}. Confirmation sent to {contact}!"
+                    unit_desc = unit_to_book.get("unit_id") if unit_to_book else self.state.property_name
+                    response["text"] = f"Perfect! You're booked for {confirmation['tour_time']} at {unit_desc}. Confirmation sent to {contact}!"
                 except Exception as e:
                     logger.error("Booking failed: %s", e)
                     response["text"] = "I'm having trouble with the booking system. Let me try again - what's your preferred day and time?"
